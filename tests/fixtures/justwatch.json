@@ -1,0 +1,247 @@
+{
+  "data": {
+    "searchTitles": {
+      "edges": [
+        {
+          "node": {
+            "id": "tm338499",
+            "objectType": "MOVIE",
+            "content": {
+              "fullPath": "/uk/movie/flatball-a-history-of-ultimate",
+              "title": "Flatball: A History of Ultimate",
+              "originalReleaseYear": 2016,
+              "posterUrl": "/poster/142095326/{profile}/flatball-a-history-of-ultimate.{format}",
+              "__typename": "MovieContent"
+            },
+            "offers": [
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/flatball---a-history-of-ultimate/umc.cmc.drnve62utn2ny5vtx4jlq8e6",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/flatball---a-history-of-ultimate/umc.cmc.drnve62utn2ny5vtx4jlq8e6",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://play.google.com/store/movies/details/Flatball_A_History_of_Ultimate",
+                "package": {
+                  "shortName": "ply"
+                }
+              },
+              {
+                "standardWebURL": "https://www.youtube.com/results",
+                "package": {
+                  "shortName": "yot"
+                }
+              },
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/flatball---a-history-of-ultimate/umc.cmc.drnve62utn2ny5vtx4jlq8e6",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://play.google.com/store/movies/details/Flatball_A_History_of_Ultimate",
+                "package": {
+                  "shortName": "ply"
+                }
+              },
+              {
+                "standardWebURL": "https://www.youtube.com/results",
+                "package": {
+                  "shortName": "yot"
+                }
+              },
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/flatball---a-history-of-ultimate/umc.cmc.drnve62utn2ny5vtx4jlq8e6",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://play.google.com/store/movies/details/Flatball_A_History_of_Ultimate",
+                "package": {
+                  "shortName": "ply"
+                }
+              },
+              {
+                "standardWebURL": "https://www.youtube.com/results",
+                "package": {
+                  "shortName": "yot"
+                }
+              }
+            ]
+          },
+          "__typename": "TitleSearchResultEdge"
+        },
+        {
+          "node": {
+            "id": "tm186000",
+            "objectType": "MOVIE",
+            "content": {
+              "fullPath": "/uk/movie/a-history-of-violence",
+              "title": "A History of Violence",
+              "originalReleaseYear": 2005,
+              "posterUrl": "/poster/333290915/{profile}/a-history-of-violence.{format}",
+              "__typename": "MovieContent"
+            },
+            "offers": [
+              {
+                "standardWebURL": "https://www.netflix.com/title/70032597",
+                "package": {
+                  "shortName": "nfx"
+                }
+              },
+              {
+                "standardWebURL": "https://www.netflix.com/title/70032597",
+                "package": {
+                  "shortName": "nfx"
+                }
+              },
+              {
+                "standardWebURL": "https://www.netflix.com/title/70032597",
+                "package": {
+                  "shortName": "nfa"
+                }
+              },
+              {
+                "standardWebURL": "https://www.netflix.com/title/70032597",
+                "package": {
+                  "shortName": "nfa"
+                }
+              },
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/a-history-of-violence/umc.cmc.3fassqo6ee1ah492ypb7xkcvs",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/a-history-of-violence/umc.cmc.3fassqo6ee1ah492ypb7xkcvs",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://play.google.com/store/movies/details/A_History_of_Violence",
+                "package": {
+                  "shortName": "ply"
+                }
+              },
+              {
+                "standardWebURL": "https://www.skystore.com/product/a-history-of-violence/a4ed33c0-646a-4977-871f-3234c73a2b6c",
+                "package": {
+                  "shortName": "sks"
+                }
+              },
+              {
+                "standardWebURL": "https://www.youtube.com/results",
+                "package": {
+                  "shortName": "yot"
+                }
+              },
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/a-history-of-violence/umc.cmc.3fassqo6ee1ah492ypb7xkcvs",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://tv.apple.com/gb/movie/a-history-of-violence/umc.cmc.3fassqo6ee1ah492ypb7xkcvs",
+                "package": {
+                  "shortName": "itu"
+                }
+              },
+              {
+                "standardWebURL": "https://watch.amazon.co.uk/detail",
+                "package": {
+                  "shortName": "amz"
+                }
+              },
+              {
+                "standardWebURL": "https://watch.amazon.co.uk/detail",
+                "package": {
+                  "shortName": "amz"
+                }
+              },
+              {
+                "standardWebURL": "https://www.skystore.com/product/a-history-of-violence/a4ed33c0-646a-4977-871f-3234c73a2b6c",
+                "package": {
+                  "shortName": "sks"
+                }
+              },
+              {
+                "standardWebURL": "https://play.google.com/store/movies/details/A_History_of_Violence",
+                "package": {
+                  "shortName": "ply"
+                }
+              },
+              {
+                "standardWebURL": "https://www.youtube.com/results",
+                "package": {
+                  "shortName": "yot"
+                }
+              }
+            ]
+          },
+          "__typename": "TitleSearchResultEdge"
+        },
+        {
+          "node": {
+            "id": "ts14026",
+            "objectType": "SHOW",
+            "content": {
+              "fullPath": "/uk/tv-series/a-history-of-britain",
+              "title": "A History of Britain",
+              "originalReleaseYear": 2000,
+              "posterUrl": "/poster/302523784/{profile}/a-history-of-britain.{format}",
+              "__typename": "ShowContent"
+            },
+            "offers": [
+              {
+                "standardWebURL": "http://www.bbc.co.uk/iplayer/episode/b0074kwx",
+                "package": {
+                  "shortName": "bbc"
+                }
+              },
+              {
+                "standardWebURL": "http://www.bbc.co.uk/iplayer/episode/b0074kwx",
+                "package": {
+                  "shortName": "bbc"
+                }
+              }
+            ]
+          },
+          "__typename": "TitleSearchResultEdge"
+        },
+        {
+          "node": {
+            "id": "ts14435",
+            "objectType": "SHOW",
+            "content": {
+              "fullPath": "/uk/tv-series/a-history-of-horror",
+              "title": "A History of Horror",
+              "originalReleaseYear": 2010,
+              "posterUrl": "/poster/179229163/{profile}/a-history-of-horror.{format}",
+              "__typename": "ShowContent"
+            },
+            "offers": [
+              {
+                "standardWebURL": "https://www.amazon.co.uk/History-Horror-Home-Counties/dp/B0BZ89R8ZV/ref=sr_1_1",
+                "package": {
+                  "shortName": "amz"
+                }
+              }
+            ]
+          },
+          "__typename": "TitleSearchResultEdge"
+        }
+      ],
+      "__typename": "TitleSearchResult"
+    }
+  }
+}

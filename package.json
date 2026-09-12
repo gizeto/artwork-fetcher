@@ -1,0 +1,11 @@
+{
+  "name": "tmdb-artwork-userscript",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.cjs"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "jsdom": "^26.1.0"
+  }
+}

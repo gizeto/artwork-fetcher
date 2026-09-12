@@ -88,6 +88,46 @@ test('Apple selects the main title artwork and resolves native dimensions', t =>
   assert.equal(api.appleArtwork(doc(fixture('apple.html')), 'poster', url + '-wrong').length, 0);
 });
 
+test('Kanopy unwraps native images and selects only the requested title and artwork kind', t => {
+  const { api } = environment(t);
+  const url = 'https://www.kanopy.com/en/product/justwatch-16504352?utm_source=justwatch';
+  const data = JSON.parse(fixture('kanopy.json'));
+  assert.equal(api.provider(url), 'Kanopy');
+  assert.equal(api.kanopyAPI(url), 'https://www.kanopy.com/kapi/videos/alias/justwatch-16504352?webshopId=9');
+  for (const [kind, hash] of [['backdrop', '6d67aec6-e51b'], ['poster', 'f09ff003-8d56']]) {
+    const assets = api.kanopyArtwork(data, kind, url);
+    assert.equal(assets.length, 1); assert.equal(assets[0].title, 'Travel Socks');
+    assert.match(assets[0].url, new RegExp('^https://static-assets.kanopy.com/video-images/' + hash));
+    assert.equal(assets[0].variants.length, 1); assert.doesNotMatch(assets[0].url, /width=|height=|cdn-cgi/);
+  }
+  assert.throws(() => api.kanopyArtwork(data, 'poster', url.replace('16504352', '99999999')), /matching title/);
+  data.video.images.posters = { large: 'https://attacker.test/untrusted.jpeg' };
+  assert.throws(() => api.kanopyArtwork(data, 'poster', url), /no poster artwork/);
+  const node = { id: 'kanopy1', objectType: 'MOVIE', content: { title: 'Travel Socks', originalReleaseYear: 2024 },
+    offers: [{ presentationType: 'HD', standardWebURL: url }] };
+  const titles = api.searchResults([{ country: 'US', data: { data: { searchTitles: { edges: [{ node }] } } } }], { type: 'movie', title: 'Travel Socks' });
+  assert.equal(titles[0].sources[0].provider, 'Kanopy');
+});
+
+test('direct unavailable-title URLs work without JustWatch and reject unrelated destinations', t => {
+  const { api, doc } = environment(t);
+  const prime = api.manualSource(' https://www.primevideo.com/-/de/detail/0ISBAPQV85YPX8VRKEZT6I3WMC, ');
+  assert.equal(prime.url, 'https://www.primevideo.com/-/de/detail/0ISBAPQV85YPX8VRKEZT6I3WMC');
+  const url = 'https://tv.apple.com/us/movie/bigfoot-i-love-you/umc.cmc.70td6qpxeljnbp2jd9425btiw';
+  assert.equal(api.manualSource(url).provider, 'Apple TV');
+  const assets = api.appleArtwork(doc(fixture('apple-unavailable.html')), 'backdrop', url);
+  assert.equal(assets.length, 1); assert.equal(assets[0].title, 'Bigfoot, I Love You');
+  assert.match(assets[0].url, /1920x1080\.jpg$/);
+  const config = api.uploadConfig(doc(fixture('movie-poster.html')), 'poster', { type: 'movie' });
+  assert.equal(api.cropPlan(400, 574, config).valid, false);
+  for (const bad of ['https://attacker.test/movie/1', 'https://tv.apple.com/us/search?term=test', 'https://www.kanopy.com/kapi/videos/1', 'https://user:password@tv.apple.com/us/movie/test/umc.cmc.123']) {
+    assert.throws(() => api.manualSource(bad));
+  }
+  const links = api.discoveryLinks('Bigfoot, I Love You', 'GB');
+  assert.match(links[0][1], /^https:\/\/tv.apple.com\/gb\/search\?term=/);
+  assert.ok(links.some(([text]) => text === 'Find indexed Amazon pages'));
+});
+
 test('all captured TMDB upload forms provide tokens, media types and image limits', t => {
   const { api, doc } = environment(t);
   for (const [name, type, kind, max] of [
@@ -202,6 +242,49 @@ test('one failed provider does not discard another provider preview', async t =>
   assert.match(app.results.textContent, /Provider blocked/);
   assert.match(app.results.textContent, /Open source tab/);
   assert.equal(calls.filter(c => c.body).length, 0);
+});
+
+test('Kanopy fetch uses its destination session and retains the upload confirmation gate', async t => {
+  const env = mockApp(t); const { app, calls } = env;
+  const reads = [];
+  app.cross = async (url, options) => { reads.push({ url, options }); return fixture('kanopy.json'); };
+  await app.fetchTitle({ sources: [app.target && env.api.manualSource('https://www.kanopy.com/en/product/justwatch-16504352')] });
+  assert.equal(reads.length, 1); assert.equal(reads[0].options.anonymous, false);
+  assert.match(reads[0].url, /\/kapi\/videos\/alias\/justwatch-16504352\?webshopId=9$/);
+  assert.equal(app.results.querySelectorAll('img').length, 1);
+  assert.equal(calls.filter(c => c.body).length, 0);
+});
+
+test('direct URL UI fetches and remembers a source even if JustWatch returns nothing', async t => {
+  const env = mockApp(t); const { app, stored, calls } = env;
+  app.cross = async url => url.includes('justwatch') ? '{"data":{"searchTitles":{"edges":[]}}}' : fixture('apple-unavailable.html');
+  app.open('poster'); await tick();
+  const input = app.panel.querySelector('[aria-label="Provider title URL"]');
+  input.value = 'https://tv.apple.com/us/movie/bigfoot-i-love-you/umc.cmc.70td6qpxeljnbp2jd9425btiw';
+  [...app.panel.querySelectorAll('button')].find(b => b.textContent === 'Fetch from URL').click();
+  await tick(); await tick();
+  assert.equal(app.results.querySelectorAll('img').length, 1);
+  assert.equal(stored.get('direct-sources:movie:1508520')[0], input.value);
+  assert.equal(calls.filter(c => c.body).length, 0);
+  assert.match(app.panel.textContent, /Fetch saved Apple TV link/);
+});
+
+test('Kanopy API denial offers a source tab; helper sends only artwork metadata using same-origin fetch', async t => {
+  const env = mockApp(t); env.app.cross = async () => { throw new Error('Source returned HTTP 401.'); };
+  await env.app.fetchTitle({ sources: [env.api.manualSource('https://www.kanopy.com/en/product/justwatch-16504352')] });
+  assert.match(env.app.results.textContent, /Open source tab/);
+  assert.equal(env.calls.filter(c => c.body).length, 0);
+  const id = '11111111-1111-4111-8111-111111111111';
+  const url = 'https://www.kanopy.com/en/product/justwatch-16504352';
+  const helper = environment(t, '', url + '#tmdb-artwork=' + id);
+  helper.stored.set('tmdb-artwork-job:' + id, { id, url, kind: 'poster', state: 'waiting', expires: Date.now() + 60000 });
+  const reads = [];
+  helper.w.fetch = async (url, options) => { reads.push({ url, options }); return { ok: true, json: async () => JSON.parse(fixture('kanopy.json')) }; };
+  helper.api.helper(); helper.w.document.body.lastElementChild.shadowRoot.querySelector('button').click(); await tick();
+  assert.equal(reads.length, 1); assert.equal(reads[0].options.credentials, 'same-origin');
+  const result = helper.stored.get('tmdb-artwork-job:' + id);
+  assert.equal(result.state, 'ready'); assert.match(result.assets[0].url, /static-assets.kanopy.com/);
+  assert.equal(result.video, undefined); assert.equal(result.cookies, undefined);
 });
 
 test('closing a preview and cancelling search never upload', async t => {

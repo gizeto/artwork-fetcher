@@ -2,7 +2,7 @@
 
 ## Tampermonkey userscript
 
-[`tmdb-artwork.user.js`](tmdb-artwork.user.js) finds Amazon Video and Apple TV
+[`tmdb-artwork.user.js`](tmdb-artwork.user.js) finds Amazon Video, Apple TV, and Kanopy
 backgrounds/posters from a TMDB movie or TV series page. It prepares a JPEG in your
 browser and uploads it only when you click **Upload this image** in its preview.
 No API key, Python process, or backend is needed.
@@ -23,6 +23,9 @@ No API key, Python process, or backend is needed.
    language, then click **Upload this image**. **Save JPEG** downloads the same file
    without uploading it. **Close** cancels pending searches/downloads.
 
+This directory is a standalone Git repository. Run its development commands here;
+the parent directory keeps the separate Python downloader and ignored HAR files.
+
 **Settings** saves your JustWatch regions. The default is `US`; for example,
 `US, GB, PL` combines those markets. Language is an editable TMDB language tag:
 `xx-XX` means no language, `en-US` means English, and `pl-PL` means Polish. The
@@ -34,14 +37,45 @@ or challenge yourself, and click **Send artwork to TMDB** there. Return to TMDB
 to review the image. The helper exchanges only artwork metadata, never session
 cookies or TMDB tokens, and expires after ten minutes. It does not upload anything.
 
+### Titles without current streaming offers
+
+Expand **No streaming link? Find or paste a provider page**. Use the provider-search
+or indexed-web-search links, then paste the Amazon/Prime Video, Apple TV, or Kanopy
+title URL into **Fetch from URL**. This path does not require a JustWatch result.
+The link is remembered for that TMDB title and can be reused with **Fetch saved
+… link**. **Forget saved links** removes those local mappings.
+
+An existing page can retain artwork even when a provider's own search and JustWatch
+do not list the title. The discovery buttons open normal browser search tabs;
+the script does not scrape search-engine results or silently select a title.
+See [the investigation and tested examples](DISCOVERY.md).
+
+### Kanopy
+
+Kanopy links from JustWatch and direct `/product/<alias>` URLs are supported. The
+script requests the title's video metadata, selects `landscapes` or `posters`, and
+unwraps the image proxy URL to download the original `static-assets.kanopy.com`
+file. It does not enlarge Kanopy's 960px thumbnail or request a stretched 4096px copy.
+
+The captured title endpoint is `/kapi/videos/alias/<alias>?webshopId=9`. It returned
+200 in the supplied browser capture, but 401 in standalone checks, including after
+loading its public page with a fresh cookie jar. The script allows Kanopy-scoped cookies
+on this request. If it fails, **Open source tab**, let the Kanopy page load, then
+click **Send artwork to TMDB**. The helper makes the same-origin metadata request.
+No Kanopy credentials or cookies are copied to TMDB or other tabs. This browser
+session path is covered by mocked tests but still needs a real browser check.
+
 ### Image processing and limitations
 
-- Both providers are shown when JustWatch has video title links for them in your chosen
+- Providers are shown when JustWatch has video title links for them in your chosen
   regions. Physical disc offers and generic provider homepage links are excluded. One provider
   failing does not discard images already fetched from another.
 - Amazon compares the original asset with `SX4096_FMavif_PQ100` and keeps the larger
   decoded result. Apple uses the current title's artwork at its declared source
   dimensions. A large requested URL does not guarantee a large original image.
+- Kanopy downloads its original landscape/poster image, with no resizing-proxy
+  transformation. In the supplied Travel Socks example those originals are
+  1920×1080 and 1548×2189 respectively, before the TMDB crop.
 - The image is center-cropped, never enlarged, and saved as JPEG at canvas quality
   `1.0`. Browser JPEG encoding is browser-dependent. The exact final JPEG is shown
   before upload. Amazon's portrait image can have a different ratio from TMDB.
@@ -64,7 +98,7 @@ cookies or TMDB tokens, and expires after ten minutes. It does not upload anythi
   These website interfaces are undocumented and may change. Provider recovery
   requires the source tab to retain the helper fragment and remain on the same
   origin. Currently supported Amazon storefronts are listed in the userscript's
-  `@match`/`@connect` header, alongside Prime Video and Apple TV.
+  `@match`/`@connect` header, alongside Prime Video, Apple TV, and Kanopy.
 
 ### Development and verification
 
@@ -81,8 +115,10 @@ Raw HARs, browser environments, and downloads remain ignored by Git.
 
 Tests cover provider parsing, region merging, TMDB form variants, real JPEG bytes
 and cropping, mocked upload confirmation, cancellation, double-click prevention,
-uncertain failures, and language-only retries. Read-only live checks verified
-JustWatch search and movie/TV artwork extraction from Amazon and Apple.
+uncertain failures, language-only retries, Kanopy metadata/native image selection,
+and direct provider URLs without JustWatch results. Read-only live checks verified
+JustWatch search, movie/TV artwork extraction from Amazon and Apple, and Kanopy's
+original image downloads. The standalone Kanopy metadata limitation is noted above.
 
 A connected Chrome/Tampermonkey session was unavailable during development, so
 extension permissions and the real browser upload flow still need a smoke test.

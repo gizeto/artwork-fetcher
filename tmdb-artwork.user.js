@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TMDB artwork finder
 // @namespace    local.tmdb-artwork
-// @version      1.0.0
-// @description  Find Amazon and Apple artwork, preview a JPEG, and confirm its upload to TMDB.
+// @version      1.1.0
+// @description  Find Amazon, Apple and Kanopy artwork, preview a JPEG, and confirm its upload to TMDB.
 // @match        https://www.themoviedb.org/movie/*
 // @match        https://www.themoviedb.org/tv/*
 // @match        https://www.amazon.com/*
@@ -20,6 +20,7 @@
 // @match        https://www.amazon.pl/*
 // @match        https://www.primevideo.com/*
 // @match        https://tv.apple.com/*
+// @match        https://www.kanopy.com/*
 // @connect      apis.justwatch.com
 // @connect      amazon.com
 // @connect      amazon.co.uk
@@ -39,6 +40,8 @@
 // @connect      m.media-amazon.com
 // @connect      images-na.ssl-images-amazon.com
 // @connect      mzstatic.com
+// @connect      kanopy.com
+// @connect      static-assets.kanopy.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -91,6 +94,7 @@
       const u = new URL(url);
       if (u.protocol !== 'https:') return null;
       if (u.hostname === 'tv.apple.com') return 'Apple TV';
+      if (u.hostname === 'www.kanopy.com') return 'Kanopy';
       if (AMAZON.has(u.hostname.replace(/^(?:www|watch)\./, ''))) return 'Amazon';
     } catch (_) { /* Not a provider link. */ }
     return null;
@@ -108,8 +112,29 @@
   }
   function isTitleLink(url) {
     const u = new URL(url);
+    if (provider(url) === 'Kanopy') return /^(?:\/[a-z]{2})?\/product\/[a-z\d-]+\/?$/i.test(u.pathname);
     return provider(url) === 'Apple TV' ? /\/(movie|show)\/[^/]+\/umc\./.test(u.pathname) :
       /\/(?:detail|dp|product)\/[^/]+/.test(u.pathname);
+  }
+  function manualSource(value) {
+    const text = String(value).trim().replace(/[),.;]+$/, '');
+    const name = provider(text);
+    if (!name) throw new Error('Paste an HTTPS title-page URL from Amazon/Prime Video, Apple TV, or Kanopy.');
+    const parsed = new URL(text);
+    if (parsed.username || parsed.password) throw new Error('Provider links must not contain credentials.');
+    const url = canonicalProvider(text);
+    if (!isTitleLink(url)) throw new Error('Use a movie or TV title page, not a provider homepage or search page.');
+    return { url, provider: name, countries: ['Direct link'] };
+  }
+  function discoveryLinks(title, country) {
+    const storefront = country.toLowerCase();
+    const term = encodeURIComponent(title);
+    return [
+      ['Search Apple TV', `https://tv.apple.com/${storefront}/search?term=${term}`],
+      ['Search Prime Video', `https://www.primevideo.com/search?phrase=${term}`],
+      ['Find indexed Apple pages', 'https://www.google.com/search?q=' + encodeURIComponent(`"${title}" site:tv.apple.com`)],
+      ['Find indexed Amazon pages', 'https://www.google.com/search?q=' + encodeURIComponent(`"${title}" (site:primevideo.com OR site:amazon.com)`)],
+    ];
   }
   function searchResults(responses, target) {
     const titles = new Map();
@@ -145,7 +170,8 @@
     try {
       const u = new URL(url);
       return u.protocol === 'https:' && (u.hostname === 'm.media-amazon.com' ||
-        u.hostname === 'images-na.ssl-images-amazon.com' || u.hostname.endsWith('.mzstatic.com'));
+        u.hostname === 'images-na.ssl-images-amazon.com' || u.hostname.endsWith('.mzstatic.com') ||
+        (u.hostname === 'static-assets.kanopy.com' && u.pathname.startsWith('/video-images/')));
     } catch (_) { return false; }
   }
   function amazonVariants(url) {
@@ -197,6 +223,33 @@
     }
     return assets;
   }
+  function kanopyAPI(pageURL) {
+    const source = manualSource(pageURL);
+    if (source.provider !== 'Kanopy') throw new Error('Not a Kanopy title page.');
+    const alias = new URL(source.url).pathname.split('/').filter(Boolean).pop();
+    return 'https://www.kanopy.com/kapi/videos/alias/' + encodeURIComponent(alias) + '?webshopId=9';
+  }
+  function kanopyArtwork(data, kind, pageURL) {
+    const video = data?.video;
+    const expectedId = new URL(pageURL).pathname.match(/\/justwatch-(\d+)\/?$/)?.[1];
+    if (!video || (expectedId && String(video.videoId) !== expectedId)) throw new Error('Kanopy returned no matching title. Open its source tab and try again.');
+    const images = video.images?.[kind === 'backdrop' ? 'landscapes' : 'posters'] || {};
+    const assets = [];
+    for (const resized of Object.values(images)) {
+      if (typeof resized !== 'string') continue;
+      // Kanopy's CDN URL contains the original asset. Download it without the
+      // low-resolution fit=cover transformation; do not manufacture extra pixels.
+      const proxy = new URL(resized);
+      const original = proxy.hostname === 'img.kanopy.com' ?
+        proxy.pathname.match(/^\/cdn-cgi\/image\/[^/]+\/(https:\/\/static-assets\.kanopy\.com\/video-images\/.+)$/)?.[1] : resized;
+      if (isImageURL(original) && new URL(original).hostname === 'static-assets.kanopy.com') {
+        assets.push({ title: video.title, url: original, variants: [original] });
+      }
+    }
+    const unique = [...new Map(assets.map(a => [a.url, a])).values()];
+    if (!unique.length) throw new Error(`Kanopy has no ${kind === 'backdrop' ? 'background' : 'poster'} artwork for this title.`);
+    return unique;
+  }
   function extract(doc, url, kind) {
     const result = provider(url) === 'Apple TV' ? appleArtwork(doc, kind, url) : amazonArtwork(doc, kind);
     const unique = [...new Map(result.map(a => [a.url, a])).values()];
@@ -242,13 +295,13 @@
     return { id: /^[a-f\d]{24}$/i.test(id || '') ? id : null,
       processing: card?.classList.contains('processing') || false };
   }
-  function crossRequest(url, { json, blob = false, signal } = {}) {
+  function crossRequest(url, { json, blob = false, signal, anonymous = true } = {}) {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error('Cancelled.'));
       const finish = (fn, value) => { signal?.removeEventListener('abort', abort); fn(value); };
       let request;
       const abort = () => { request?.abort(); finish(reject, new Error('Cancelled.')); };
-      request = GM_xmlhttpRequest({ method: json ? 'POST' : 'GET', url, anonymous: true,
+      request = GM_xmlhttpRequest({ method: json ? 'POST' : 'GET', url, anonymous,
         headers: json ? { 'Content-Type': 'application/json', Accept: 'application/json' } : {},
         data: json ? JSON.stringify(json) : undefined, responseType: blob ? 'blob' : 'text', timeout: 30000,
         onload: r => {
@@ -385,7 +438,43 @@
       row.append(query, search); this.panel.append(row);
       this.status = element('p', '', { class: 'status', role: 'status' }); this.results = element('div', null, { class: 'grid' });
       this.panel.append(this.status, this.results);
+      this.directControls(query);
       this.search(this.target.title);
+    }
+    directControls(query) {
+      const section = element('details'); section.append(element('summary', 'No streaming link? Find or paste a provider page'));
+      section.append(element('p', 'An unavailable title may still have artwork. Search the provider or web index, then paste its title-page URL.'));
+      const links = element('div', null, { class: 'row' });
+      const refreshLinks = () => {
+        links.replaceChildren(...discoveryLinks(query.value || this.target.title, GM_getValue('regions', ['US'])[0]).map(([text, url]) => link(text, url)));
+      };
+      query.addEventListener('input', refreshLinks); refreshLinks(); section.append(links);
+      const input = element('input', null, { type: 'url', placeholder: 'https://tv.apple.com/… or Amazon/Prime Video/Kanopy title URL', 'aria-label': 'Provider title URL' });
+      const row = element('div', null, { class: 'row' }); const state = element('p', '', { role: 'status' });
+      const key = `direct-sources:${this.target.type}:${this.target.id}`;
+      const saved = element('div', null, { class: 'row' });
+      const renderSaved = () => {
+        saved.replaceChildren();
+        for (const url of GM_getValue(key, [])) {
+          let source;
+          try { source = manualSource(url); } catch (_) { continue; }
+          saved.append(button(`Fetch saved ${source.provider} link`, () => this.fetchTitle({ sources: [source] })));
+        }
+      };
+      const fetch = () => {
+        if (this.busy) return;
+        try {
+          const source = manualSource(input.value);
+          const urls = [...new Set([...GM_getValue(key, []), source.url])].slice(-10);
+          GM_setValue(key, urls); renderSaved(); state.textContent = '';
+          this.fetchTitle({ sources: [source] });
+        } catch (e) { state.textContent = e.message; }
+      };
+      row.append(input, button('Fetch from URL', fetch)); input.addEventListener('keydown', e => { if (e.key === 'Enter') fetch(); });
+      section.append(row, state, saved, button('Forget saved links', () => { if (!this.busy) { GM_deleteValue(key); renderSaved(); } }));
+      renderSaved(); if (saved.childElementCount) section.open = true;
+      // Keep this fallback above the results and available even when search fails.
+      this.panel.insertBefore(section, this.results);
     }
     async search(query) {
       if (this.busy) return;
@@ -404,7 +493,7 @@
       }));
       if (signal.aborted) return;
       const titles = searchResults(responses, this.target);
-      status.textContent = `${titles.length ? 'Choose the matching title. Provider years can differ.' : 'No matches. Edit the title or change regions in Settings.'}${errors.length ? '\n' + errors.join('\n') : ''}`;
+      status.textContent = `${titles.length ? 'Choose the matching title. Provider years can differ.' : 'No matches. Edit the title, change regions, or use a provider URL below.'}${errors.length ? '\n' + errors.join('\n') : ''}`;
       for (const title of titles) {
         const card = element('div', null, { class: 'card' });
         card.append(element('strong', `${title.title} (${title.year || 'year unknown'})`), element('p', `${title.type} · ${title.countries.join(', ')} · ${title.sources.length} provider pages`));
@@ -431,8 +520,14 @@
         card.append(link(`${source.provider} · ${source.countries.join(', ')}`, source.url)); results.append(card);
         const state = element('p', 'Loading…'); card.append(state);
         try {
-          const html = await this.cross(source.url, { signal });
-          const assets = extract(parse(html), source.url, this.kind);
+          let assets;
+          if (source.provider === 'Kanopy') {
+            const data = JSON.parse(await this.cross(kanopyAPI(source.url), { signal, anonymous: false }));
+            assets = kanopyArtwork(data, this.kind, source.url);
+          } else {
+            const html = await this.cross(source.url, { signal });
+            assets = extract(parse(html), source.url, this.kind);
+          }
           await this.addAssets(assets, source, card, config, signal);
           state.remove();
         } catch (e) {
@@ -557,14 +652,23 @@
     const host = element('div'); host.style.cssText = 'position:relative;z-index:2147483647';
     const shadow = host.attachShadow({ mode: 'open' }); shadow.append(element('style', CSS));
     const toolbar = element('div', null, { class: 'toolbar' }); const state = element('span');
-    const send = button('Send artwork to TMDB', () => {
+    const send = button('Send artwork to TMDB', async () => {
+      if (send.disabled) return;
+      send.disabled = true;
       try {
         const current = GM_getValue(key);
         if (!current || current.expires < Date.now()) throw new Error('Request expired. Open a new source tab from TMDB.');
-        const assets = extract(root.document, root.location.href, job.kind);
+        let assets;
+        if (provider(root.location.href) === 'Kanopy') {
+          const response = await root.fetch(kanopyAPI(root.location.href), { credentials: 'same-origin', signal: root.AbortSignal.timeout(30000) });
+          if (!response.ok) throw new Error(`Kanopy returned HTTP ${response.status}. Wait for the title page to finish loading, then try again.`);
+          assets = kanopyArtwork(await response.json(), job.kind, root.location.href);
+        } else assets = extract(root.document, root.location.href, job.kind);
+        const pending = GM_getValue(key);
+        if (!pending || pending.expires < Date.now()) throw new Error('Request expired. Open a new source tab from TMDB.');
         GM_setValue(key, { ...job, state: 'ready', assets });
         state.textContent = 'Artwork sent. Return to TMDB to preview it.'; send.disabled = true;
-      } catch (e) { state.textContent = e.message; }
+      } catch (e) { state.textContent = e.message; send.disabled = false; }
     });
     toolbar.append(send, state); shadow.append(toolbar); root.document.body.append(host);
   }
@@ -577,7 +681,7 @@
     if (target && !root.document.getElementById('tmdb-artwork')) new App(target);
   }
   const api = { QUERY, regions, targetFromPage, provider, canonicalProvider, searchResults, amazonVariants,
-    amazonArtwork, appleArtwork, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
+    amazonArtwork, appleArtwork, kanopyAPI, kanopyArtwork, manualSource, discoveryLinks, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else start();
 })(globalThis);

@@ -1,7 +1,12 @@
 // ==UserScript==
-// @name         TMDB artwork finder
-// @namespace    local.tmdb-artwork
-// @version      1.1.0
+// @name         artwork-fetcher
+// @namespace    https://github.com/gizeto/artwork-fetcher
+// @version      1.4.1
+// @author       gizeto
+// @homepageURL  https://github.com/gizeto/artwork-fetcher
+// @supportURL   https://github.com/gizeto/artwork-fetcher/issues
+// @downloadURL  https://raw.githubusercontent.com/gizeto/artwork-fetcher/main/artwork-fetcher.user.js
+// @updateURL    https://raw.githubusercontent.com/gizeto/artwork-fetcher/main/artwork-fetcher.user.js
 // @description  Find Amazon, Apple and Kanopy artwork, preview a JPEG, and confirm its upload to TMDB.
 // @match        https://www.themoviedb.org/movie/*
 // @match        https://www.themoviedb.org/tv/*
@@ -21,6 +26,8 @@
 // @match        https://www.primevideo.com/*
 // @match        https://tv.apple.com/*
 // @match        https://www.kanopy.com/*
+// @match        https://www.google.com/search*
+// @connect      www.google.com
 // @connect      apis.justwatch.com
 // @connect      amazon.com
 // @connect      amazon.co.uk
@@ -74,6 +81,11 @@
   const parse = html => new root.DOMParser().parseFromString(html, 'text/html');
   const normalize = s => String(s || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
   const slug = s => normalize(s).replace(/ /g, '-').slice(0, 100).replace(/-$/, '') || 'unknown-title';
+  function exactMatch(title, target) {
+    const key = value => normalize(value).replace(/ /g, '');
+    return !!key(target.title) && key(title.title) === key(target.title) &&
+      /^\d{4}$/.test(String(target.year)) && String(title.year) === String(target.year);
+  }
   function regions(value) {
     const list = [...new Set(String(value).toUpperCase().split(/[\s,;]+/).filter(Boolean))];
     if (!list.length || list.some(x => !/^[A-Z]{2}$/.test(x))) throw new Error('Enter country codes such as US, GB, PL.');
@@ -135,6 +147,80 @@
       ['Find indexed Apple pages', 'https://www.google.com/search?q=' + encodeURIComponent(`"${title}" site:tv.apple.com`)],
       ['Find indexed Amazon pages', 'https://www.google.com/search?q=' + encodeURIComponent(`"${title}" (site:primevideo.com OR site:amazon.com)`)],
     ];
+  }
+  function googleQueries(title) {
+    return ['prime video', 'apple tv'].map(provider =>
+      'https://www.google.com/search?q=' + encodeURIComponent(`${title} ${provider}`));
+  }
+  function sourceIdentity(source) {
+    const u = new URL(source.url);
+    return source.provider + ':' + (u.pathname.match(/\/(umc\.[^/]+|[A-Z0-9]{10}|[A-Z0-9]{26})(?:\/|$)/)?.[1] || source.url);
+  }
+  function googleResults(doc, type) {
+    const found = new Map();
+    for (const anchor of doc.querySelectorAll('a[href]')) {
+      try {
+        let url = new URL(anchor.getAttribute('href'), 'https://www.google.com');
+        if (url.origin === 'https://www.google.com' && url.pathname === '/url') {
+          url = new URL(url.searchParams.get('q') || url.searchParams.get('url'));
+        }
+        if (!['Amazon', 'Apple TV'].includes(provider(url.href))) continue;
+        const source = manualSource(url.href);
+        const heading = anchor.querySelector('h3, [role="heading"]');
+        const titleNode = heading?.cloneNode(true) || anchor.cloneNode(true);
+        titleNode.querySelectorAll('cite, time, script, style, [aria-hidden="true"]').forEach(node => node.remove());
+        const title = cleanGoogleTitle(titleNode.textContent);
+        if (!title || /^https?:\/\//.test(title)) continue;
+        if (source.provider === 'Apple TV' && !url.pathname.includes(type === 'tv' ? '/show/' : '/movie/')) continue;
+        source.countries = ['Google', ...(source.provider === 'Apple TV' ? [url.pathname.split('/')[1].toUpperCase()] : [])];
+        const key = sourceIdentity(source);
+        if (!found.has(key)) found.set(key, { title, sources: [source] });
+      } catch (_) { /* Ignore tracking links, search controls and unsupported URLs. */ }
+    }
+    return [...found.values()];
+  }
+  function cleanGoogleTitle(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim()
+      .replace(/\s*(?:[-|–—:]\s*)?(?:Amazon(?:\.com)?(?:\s+Prime)?\s+Video|Prime\s*Video|Apple\s*TV)(?:\s*[-|–—:]?\s*\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)?\s*$/i, '')
+      .replace(/^Watch\s+/i, '').trim().slice(0, 300);
+  }
+  function providerMetadata(doc, pageURL) {
+    const year = value => String(value || '').match(/\b(?:18|19|20|21)\d{2}\b/)?.[0] || '';
+    const id = new URL(pageURL).pathname.split('/').filter(Boolean).pop();
+    if (provider(pageURL) === 'Amazon') {
+      const node = doc.querySelector('#dv-web-page-hydration-data');
+      if (node) {
+        const headers = JSON.parse(node.textContent).init?.preparations?.body?.atf?.state?.detail?.headerDetail || {};
+        const entry = headers[id] || (Object.keys(headers).length === 1 ? Object.values(headers)[0] : null);
+        if (entry?.title) return { title: entry.title, year: year(entry.releaseYear) || year(entry.releaseDate),
+          type: entry.titleType === 'movie' ? 'Movie' : entry.titleType ? 'TV series' : '' };
+      }
+    } else if (provider(pageURL) === 'Apple TV') {
+      const node = doc.querySelector('#serialized-server-data');
+      if (node) {
+        for (const entry of JSON.parse(node.textContent).data || []) {
+          const page = entry?.data;
+          if (!page?.canonicalURL || new URL(page.canonicalURL).pathname.split('/').filter(Boolean).pop() !== id) continue;
+          for (const shelf of page.shelves || []) for (const item of shelf.items || []) {
+            if (item.$kind !== 'SuperheroLockup' || !item.title) continue;
+            return { title: item.title, year: (item.badgeRowMetadata || []).map(String).find(s => /^\d{4}$/.test(s)) || year(item.releaseDate),
+              type: item.type === 'Movie' || item.primaryMetadata?.includes('Movie') ? 'Movie' : 'TV series' };
+          }
+        }
+      }
+    }
+    // Only title-level structured data, never a search snippet's crawl date or recommendations.
+    for (const node of doc.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const data = JSON.parse(node.textContent);
+        const entries = Array.isArray(data) ? data : data['@graph'] || [data];
+        const candidates = entries.filter(item => ['Movie', 'TVSeries'].includes(item['@type']) && item.name &&
+          (!item.url || sourceIdentity(manualSource(item.url)) === sourceIdentity(manualSource(pageURL))));
+        if (candidates.length === 1) return { title: candidates[0].name, year: year(candidates[0].datePublished),
+          type: candidates[0]['@type'] === 'Movie' ? 'Movie' : 'TV series' };
+      } catch (_) { /* Malformed or unrelated structured data. */ }
+    }
+    throw new Error('Title/year metadata unavailable.');
   }
   function searchResults(responses, target) {
     const titles = new Map();
@@ -223,11 +309,25 @@
     }
     return assets;
   }
-  function kanopyAPI(pageURL) {
+  function kanopyAPI(pageURL, webshopId = 9) {
     const source = manualSource(pageURL);
     if (source.provider !== 'Kanopy') throw new Error('Not a Kanopy title page.');
     const alias = new URL(source.url).pathname.split('/').filter(Boolean).pop();
-    return 'https://www.kanopy.com/kapi/videos/alias/' + encodeURIComponent(alias) + '?webshopId=9';
+    return 'https://www.kanopy.com/kapi/videos/alias/' + encodeURIComponent(alias) + '?webshopId=' + encodeURIComponent(webshopId);
+  }
+  async function fetchKanopy(pageURL, kind, request, signal) {
+    // The public client performs this visitor handshake before reading metadata.
+    // Keep the anonymous JWT in memory and send it only to Kanopy's API.
+    const headers = { Accept: 'application/json', 'X-Version': 'web/undefined/undefined/undefined' };
+    const session = JSON.parse(await request('https://www.kanopy.com/kapi/handshake', { signal, headers, anonymous: true }));
+    if (typeof session.jwt !== 'string' || !session.jwt || !Number.isInteger(session.webshopId) || session.webshopId <= 0) {
+      throw new Error('Kanopy visitor initialization failed. Open the source tab and try again.');
+    }
+    if (signal?.aborted) throw new Error('Cancelled.');
+    const data = JSON.parse(await request(kanopyAPI(pageURL, session.webshopId), {
+      signal, anonymous: true, headers: { ...headers, Authorization: 'Bearer ' + session.jwt },
+    }));
+    return kanopyArtwork(data, kind, pageURL);
   }
   function kanopyArtwork(data, kind, pageURL) {
     const video = data?.video;
@@ -295,14 +395,14 @@
     return { id: /^[a-f\d]{24}$/i.test(id || '') ? id : null,
       processing: card?.classList.contains('processing') || false };
   }
-  function crossRequest(url, { json, blob = false, signal, anonymous = true } = {}) {
+  function crossRequest(url, { json, blob = false, signal, anonymous = true, headers = {} } = {}) {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error('Cancelled.'));
       const finish = (fn, value) => { signal?.removeEventListener('abort', abort); fn(value); };
       let request;
       const abort = () => { request?.abort(); finish(reject, new Error('Cancelled.')); };
       request = GM_xmlhttpRequest({ method: json ? 'POST' : 'GET', url, anonymous,
-        headers: json ? { 'Content-Type': 'application/json', Accept: 'application/json' } : {},
+        headers: { ...(json ? { 'Content-Type': 'application/json', Accept: 'application/json' } : {}), ...headers },
         data: json ? JSON.stringify(json) : undefined, responseType: blob ? 'blob' : 'text', timeout: 30000,
         onload: r => {
           if (r.status < 200 || r.status >= 300) return finish(reject, new Error(`Source returned HTTP ${r.status}.`));
@@ -363,7 +463,7 @@
       ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(best.image, crop.x, crop.y, crop.cropWidth, crop.cropHeight, 0, 0, crop.width, crop.height);
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 1.0));
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
       if (!blob || blob.type !== 'image/jpeg') throw new Error('JPEG conversion failed.');
       return { blob, crop, sourceWidth: best.width, sourceHeight: best.height };
     } finally { best.close(); }
@@ -381,15 +481,26 @@
   const CSS = `
     :host { all: initial; font: 14px/1.5 system-ui,sans-serif; color:#edf4fb; }
     * { box-sizing:border-box; } button,input,select { font:inherit; } button { cursor:pointer; border:0; border-radius:6px; padding:9px 13px; color:#fff; background:#166a94; }
+    [hidden] { display:none !important; }
     button:hover { background:#238ab8; } button:disabled { opacity:.45; cursor:default; }
     .toolbar { position:fixed; bottom:18px; right:18px; display:flex; flex-wrap:wrap; gap:7px; padding:10px; background:#102435; border:1px solid #426279; border-radius:10px; box-shadow:0 4px 18px #0005; }
     .overlay { position:fixed; inset:0; background:#0009; display:flex; align-items:center; justify-content:center; padding:20px; }
     .panel { width:1000px; max-width:100%; max-height:92vh; overflow:auto; background:#102435; padding:22px; border:1px solid #426279; border-radius:12px; }
+    .dialog-header { display:flex; align-items:center; gap:16px; position:sticky; top:-22px; margin:-22px -22px 14px; padding:16px 22px; background:#102435; z-index:1; }
+    .dialog-header h2 { margin:0; flex:1; } .close { font-size:26px; line-height:1; width:36px; height:36px; padding:0; flex-shrink:0; background:transparent; color:#bcd0df; }
     h2 { margin:0 0 14px; font-size:22px; } p { margin:10px 0; } a { color:#69d5fb; } label { display:inline-flex; gap:8px; align-items:center; }
     input,select { padding:7px; border:1px solid #7591a5; border-radius:4px; background:#fff; color:#122433; }
     .row { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:12px 0; } .row input { flex:1; min-width:180px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(270px,1fr)); gap:16px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(270px,100%),1fr)); gap:16px; }
     .card { padding:14px; border:1px solid #426279; border-radius:8px; overflow:hidden; }
+    .exact-match { border-color:#648c7d; background:#16332f; } .match-label { display:block; color:#abcabb; font-size:12px; margin:4px 0; }
+    details { margin-top:18px; } .google-section { grid-column:1/-1; }
+    .google-heading { display:block; font-size:16px; margin-bottom:14px; }
+    .google-card { display:flex; flex-direction:column; gap:8px; min-width:0; }
+    .google-card strong { font-size:16px; line-height:1.4; overflow-wrap:anywhere; }
+    .google-card p { margin:0; } .google-meta, .google-summary { color:#b3c5d3; font-size:13px; }
+    .google-actions { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding-top:12px; margin-top:auto; }
+    .google-note { font-size:12px; color:#b3c5d3; } .google-summary { margin:12px 0 0; }
     img { display:block; width:100%; height:260px; object-fit:contain; background:#07111a; cursor:zoom-in; }
     .full { max-height:65vh; height:auto; } .error { color:#ffc5b8; } .status { white-space:pre-wrap; }
   `;
@@ -404,11 +515,12 @@
       const toolbar = element('div', null, { class: 'toolbar' });
       toolbar.append(button('Fetch background', () => this.open('backdrop')), button('Fetch poster', () => this.open('poster')), button('Settings', () => this.settings()));
       this.shadow.append(toolbar); root.document.body.append(this.host);
+      root.addEventListener('pagehide', () => this.cleanup(), { once: true });
     }
     cleanup() {
       this.controller?.abort();
       this.urls.forEach(url => root.URL.revokeObjectURL(url)); this.urls = [];
-      for (const job of this.jobs) { root.clearTimeout(job.timer); GM_removeValueChangeListener(job.listener); GM_deleteValue(PREFIX + job.id); }
+      for (const job of this.jobs) { root.clearTimeout(job.timer); root.clearTimeout(job.attentionTimer); job.tab?.close?.(); GM_removeValueChangeListener(job.listener); GM_deleteValue(PREFIX + job.id); }
       this.jobs = [];
     }
     shell(title) {
@@ -416,9 +528,11 @@
       this.cleanup(); this.overlay?.remove(); this.controller = new root.AbortController();
       this.overlay = element('div', null, { class: 'overlay' });
       this.panel = element('div', null, { class: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
-      this.panel.append(element('h2', title));
-      this.close = button('Close', () => { if (!this.busy) { this.cleanup(); this.overlay.remove(); } });
-      this.panel.append(this.close); this.overlay.append(this.panel); this.shadow.append(this.overlay);
+      const header = element('div', null, { class: 'dialog-header' });
+      this.close = button('×', () => { if (!this.busy) { this.cleanup(); this.overlay.remove(); } });
+      this.close.className = 'close'; this.close.setAttribute('aria-label', 'Close'); this.close.title = 'Close';
+      header.append(element('h2', title), this.close);
+      this.panel.append(header); this.overlay.append(this.panel); this.shadow.append(this.overlay);
       this.close.focus(); return true;
     }
     settings() {
@@ -473,8 +587,7 @@
       row.append(input, button('Fetch from URL', fetch)); input.addEventListener('keydown', e => { if (e.key === 'Enter') fetch(); });
       section.append(row, state, saved, button('Forget saved links', () => { if (!this.busy) { GM_deleteValue(key); renderSaved(); } }));
       renderSaved(); if (saved.childElementCount) section.open = true;
-      // Keep this fallback above the results and available even when search fails.
-      this.panel.insertBefore(section, this.results);
+      this.panel.append(section);
     }
     async search(query) {
       if (this.busy) return;
@@ -495,11 +608,130 @@
       const titles = searchResults(responses, this.target);
       status.textContent = `${titles.length ? 'Choose the matching title. Provider years can differ.' : 'No matches. Edit the title, change regions, or use a provider URL below.'}${errors.length ? '\n' + errors.join('\n') : ''}`;
       for (const title of titles) {
-        const card = element('div', null, { class: 'card' });
+        const card = this.titleCard(title);
         card.append(element('strong', `${title.title} (${title.year || 'year unknown'})`), element('p', `${title.type} · ${title.countries.join(', ')} · ${title.sources.length} provider pages`));
         const choose = button('Fetch artwork', () => this.fetchTitle(title)); choose.disabled = !title.sources.length;
         card.append(choose); results.append(card);
       }
+      if (!titles.some(title => normalize(title.title) === normalize(query) && title.sources.length)) {
+        await this.googleSearch(query, signal, results);
+      }
+    }
+    titleCard(title) {
+      const matched = exactMatch(title, this.target);
+      const card = element('div', null, { class: matched ? 'card exact-match' : 'card' });
+      if (matched) card.append(element('span', 'Title & year match', { class: 'match-label' }));
+      return card;
+    }
+    async renderGoogle(titles, container, context) {
+      const { seen, signal, summary } = context;
+      const pending = [];
+      for (const title of titles) {
+        if (signal.aborted) return;
+        const source = title.sources[0]; const key = sourceIdentity(source);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const card = element('div', null, { class: 'card google-card' });
+        const heading = element('strong', cleanGoogleTitle(title.title));
+        const badge = element('span', 'Title & year match', { class: 'match-label' }); badge.hidden = true;
+        const region = source.provider === 'Apple TV' ? new URL(source.url).pathname.split('/')[1].toUpperCase() : '';
+        const providerLine = [source.provider, region].filter(Boolean).join(' · ');
+        const meta = element('p', providerLine + ' · Reading year…', { class: 'google-meta' });
+        const note = element('p', '', { class: 'google-note' }); note.hidden = true;
+        const actions = element('div', null, { class: 'google-actions' });
+        actions.append(link('View provider page', source.url), button('Fetch artwork', () => this.fetchTitle(title)));
+        card.append(heading, badge, meta, note, actions);
+        container.append(card);
+        pending.push(async () => {
+          try {
+            const html = await this.cross(source.url, { signal });
+            if (signal.aborted) return;
+            const metadata = providerMetadata(parse(html), source.url);
+            Object.assign(title, metadata); heading.textContent = metadata.title;
+            meta.textContent = [providerLine, metadata.type, metadata.year || 'Year unknown'].filter(Boolean).join(' · ');
+            const matched = exactMatch(metadata, this.target);
+            card.classList.toggle('exact-match', matched); badge.hidden = !matched;
+          } catch (_) {
+            if (signal.aborted) return;
+            meta.textContent = providerLine + ' · Year unknown';
+            note.textContent = 'Could not read provider details. Open the page to check.'; note.hidden = false;
+          }
+        });
+      }
+      summary.textContent = `${seen.size} provider ${seen.size === 1 ? 'page' : 'pages'} found`;
+      // Bound metadata traffic; a blocked provider never discards another card.
+      await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
+        while (pending.length && !signal.aborted) await pending.shift()();
+      }));
+    }
+    async googleSearch(query, signal, results) {
+      const section = element('div', null, { class: 'card google-section' });
+      section.append(element('strong', 'Google Search fallback', { class: 'google-heading' }));
+      const grid = element('div', null, { class: 'grid' });
+      const states = element('div'); const summary = element('p', '0 provider pages found', { class: 'google-summary', role: 'status' });
+      section.append(grid, states, summary); results.append(section);
+      const context = { seen: new Set(), signal, summary };
+      await Promise.all(googleQueries(query).map(async url => {
+        const state = element('p', 'Searching Google…'); states.append(state);
+        try {
+          const html = await this.cross(url, { signal });
+          if (signal.aborted) return;
+          const titles = googleResults(parse(html), this.target.type);
+          if (!titles.length) throw new Error('No readable provider results. Google may require JavaScript, consent, or a challenge.');
+          await this.renderGoogle(titles, grid, context); state.remove();
+        } catch (e) {
+          if (signal.aborted) return;
+          this.googleTab(url, grid, context, signal, state, e.message);
+        }
+      }));
+    }
+    googleTab(url, grid, context, signal, state, initialError) {
+      if (signal.aborted || this.busy) return;
+      const id = root.crypto.randomUUID(), key = PREFIX + id;
+      const job = { id, url, mode: 'search', type: this.target.type, expires: Date.now() + TTL, state: 'waiting' };
+      const record = { id }; this.jobs.push(record);
+      const query = new URL(url).searchParams.get('q');
+      const destination = new URL(url); destination.hash = 'tmdb-artwork=' + id;
+      const closeTab = () => {
+        if (record.tab) { record.tab.onclose = null; record.tab.close?.(); record.tab = null; }
+      };
+      let done = false;
+      const finish = () => {
+        done = true; root.clearTimeout(record.timer); root.clearTimeout(record.attentionTimer);
+        GM_removeValueChangeListener(record.listener); GM_deleteValue(key); closeTab();
+      };
+      const attention = message => {
+        if (done || signal.aborted) return;
+        state.replaceChildren(element('span', `${query}: ${message} `), button('Open Google to resolve', () => {
+          if (signal.aborted || done || this.busy) return;
+          closeTab(); openTab(true);
+        }));
+      };
+      const openTab = active => {
+        try {
+          record.tab = GM_openInTab(destination.href, { active, insert: true, setParent: true });
+          if (record.tab) record.tab.onclose = () => attention('The search tab closed before returning results.');
+        } catch (e) { attention(e.message); }
+      };
+      GM_setValue(key, job);
+      record.listener = GM_addValueChangeListener(key, async (_key, _old, value) => {
+        if (done || signal.aborted || !value || value.id !== id || value.state !== 'ready' || value.expires < Date.now()) return;
+        finish();
+        try {
+          if (!Array.isArray(value.titles)) throw new Error('Invalid Google response.');
+          const titles = value.titles.slice(0, 30).map(item => {
+            const source = manualSource(item.sources?.[0]?.url);
+            if (!['Amazon', 'Apple TV'].includes(source.provider)) throw new Error('Unsupported Google result.');
+            source.countries = ['Google'];
+            return { title: String(item.title).slice(0, 300), sources: [source] };
+          });
+          await this.renderGoogle(titles, grid, context); state.remove();
+        } catch (e) { if (!signal.aborted) state.textContent = e.message; }
+      });
+      state.textContent = `${query}: Searching in a background tab…`;
+      record.attentionTimer = root.setTimeout(() => attention('No results received yet. Google may require consent or a challenge, or have no matching pages. ' + initialError), 20000);
+      record.timer = root.setTimeout(() => { state.textContent = `${query}: Search expired. Run the search again to retry.`; finish(); }, TTL);
+      openTab(false);
     }
     async config(signal) {
       const html = await this.request(`${this.target.path}/images/${this.kind === 'backdrop' ? 'backdrops' : 'posters'}/upload`, { signal });
@@ -522,8 +754,7 @@
         try {
           let assets;
           if (source.provider === 'Kanopy') {
-            const data = JSON.parse(await this.cross(kanopyAPI(source.url), { signal, anonymous: false }));
-            assets = kanopyArtwork(data, this.kind, source.url);
+            assets = await fetchKanopy(source.url, this.kind, this.cross, signal);
           } else {
             const html = await this.cross(source.url, { signal });
             assets = extract(parse(html), source.url, this.kind);
@@ -642,13 +873,37 @@
       this.jobs.push({ id, listener, timer });
     }
   }
+  function googleHelper(job, key) {
+    // Observe only the request-specific Google page. No artwork fetching or upload.
+    let debounce;
+    const observer = new root.MutationObserver(() => {
+      root.clearTimeout(debounce); debounce = root.setTimeout(scan, 250);
+    });
+    const stop = () => { observer.disconnect(); root.clearTimeout(debounce); root.clearInterval(expiry); };
+    const currentSearch = () => root.location.origin === 'https://www.google.com' && root.location.pathname === '/search' &&
+      new URL(job.url).searchParams.get('q') === new URL(root.location.href).searchParams.get('q');
+    const scan = () => {
+      const current = GM_getValue(key);
+      if (!current || current.state !== 'waiting' || current.expires < Date.now() || !currentSearch()) { stop(); return; }
+      const titles = googleResults(root.document, job.type);
+      if (titles.length) { GM_setValue(key, { ...job, state: 'ready', titles }); stop(); }
+    };
+    const expiry = root.setInterval(scan, 10000);
+    observer.observe(root.document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+    root.addEventListener('pagehide', stop, { once: true });
+    scan();
+  }
   function helper() {
     const id = new URLSearchParams(root.location.hash.slice(1)).get('tmdb-artwork');
     if (!id || !/^[a-f\d-]{36}$/i.test(id)) return;
     const key = PREFIX + id; const job = GM_getValue(key);
     // Providers can redirect a title to a different slug. Keep the job bound to its
     // source origin, a title route, and the unguessable request ID in the fragment.
-    if (!job || job.expires < Date.now() || new URL(job.url).origin !== root.location.origin || !isTitleLink(root.location.href)) return;
+    if (!job || job.state !== 'waiting' || job.expires < Date.now() || new URL(job.url).origin !== root.location.origin) return;
+    const searching = job.mode === 'search';
+    if (searching ? root.location.origin !== 'https://www.google.com' || root.location.pathname !== '/search' ||
+      new URL(job.url).searchParams.get('q') !== new URL(root.location.href).searchParams.get('q') : !isTitleLink(root.location.href)) return;
+    if (searching) { googleHelper(job, key); return; }
     const host = element('div'); host.style.cssText = 'position:relative;z-index:2147483647';
     const shadow = host.attachShadow({ mode: 'open' }); shadow.append(element('style', CSS));
     const toolbar = element('div', null, { class: 'toolbar' }); const state = element('span');
@@ -657,12 +912,14 @@
       send.disabled = true;
       try {
         const current = GM_getValue(key);
-        if (!current || current.expires < Date.now()) throw new Error('Request expired. Open a new source tab from TMDB.');
+        if (!current || current.state !== 'waiting' || current.expires < Date.now()) throw new Error('Request expired. Open a new source tab from TMDB.');
         let assets;
         if (provider(root.location.href) === 'Kanopy') {
-          const response = await root.fetch(kanopyAPI(root.location.href), { credentials: 'same-origin', signal: root.AbortSignal.timeout(30000) });
-          if (!response.ok) throw new Error(`Kanopy returned HTTP ${response.status}. Wait for the title page to finish loading, then try again.`);
-          assets = kanopyArtwork(await response.json(), job.kind, root.location.href);
+          assets = await fetchKanopy(root.location.href, job.kind, async (url, options) => {
+            const response = await root.fetch(url, { credentials: 'same-origin', headers: options.headers, signal: options.signal });
+            if (!response.ok) throw new Error(`Kanopy returned HTTP ${response.status}. Wait for the title page to finish loading, then try again.`);
+            return response.text();
+          }, root.AbortSignal.timeout(30000));
         } else assets = extract(root.document, root.location.href, job.kind);
         const pending = GM_getValue(key);
         if (!pending || pending.expires < Date.now()) throw new Error('Request expired. Open a new source tab from TMDB.');
@@ -676,12 +933,12 @@
     for (const key of GM_listValues()) {
       if (key.startsWith(PREFIX) && GM_getValue(key)?.expires < Date.now()) GM_deleteValue(key);
     }
-    if (provider(root.location.href)) { helper(); return; }
+    if (provider(root.location.href) || root.location.origin === 'https://www.google.com') { helper(); return; }
     const target = targetFromPage(root.document, root.location.href);
     if (target && !root.document.getElementById('tmdb-artwork')) new App(target);
   }
-  const api = { QUERY, regions, targetFromPage, provider, canonicalProvider, searchResults, amazonVariants,
-    amazonArtwork, appleArtwork, kanopyAPI, kanopyArtwork, manualSource, discoveryLinks, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
+  const api = { QUERY, regions, targetFromPage, exactMatch, provider, canonicalProvider, searchResults, amazonVariants,
+    amazonArtwork, appleArtwork, kanopyAPI, kanopyArtwork, fetchKanopy, manualSource, discoveryLinks, googleQueries, googleResults, cleanGoogleTitle, providerMetadata, crossRequest, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else start();
 })(globalThis);

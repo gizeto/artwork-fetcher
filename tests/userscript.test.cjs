@@ -89,6 +89,27 @@ test('Apple selects the main title artwork and resolves native dimensions', t =>
   assert.equal(api.appleArtwork(doc(fixture('apple.html')), 'poster', url + '-wrong').length, 0);
 });
 
+test('Apple title selection tolerates trailing slashes without selecting another title', t => {
+  const { api, doc } = environment(t);
+  const page = doc(fixture('apple.html'));
+  const script = page.querySelector('#serialized-server-data');
+  const data = JSON.parse(script.textContent);
+  const canonical = new URL(data.data[0].data.canonicalURL);
+  const titleURL = canonical.origin + canonical.pathname;
+
+  for (const canonicalSuffix of ['', '/']) {
+    data.data[0].data.canonicalURL = titleURL + canonicalSuffix;
+    script.textContent = JSON.stringify(data);
+    for (const requestedSuffix of ['', '/']) {
+      const url = titleURL + requestedSuffix;
+      assert.equal(api.appleArtwork(page, 'poster', url).length, 1);
+      assert.equal(api.providerMetadata(page, url).title, 'Flatball - A History of Ultimate');
+    }
+    assert.equal(api.appleArtwork(page, 'poster', titleURL + '-wrong/').length, 0);
+    assert.throws(() => api.providerMetadata(page, titleURL + '-wrong/'), /unavailable/);
+  }
+});
+
 test('Kanopy unwraps native images and selects only the requested title and artwork kind', t => {
   const { api } = environment(t);
   const url = 'https://www.kanopy.com/en/product/justwatch-16504352?utm_source=justwatch';
@@ -140,6 +161,9 @@ test('all captured TMDB upload forms provide tokens, media types and image limit
   }
   assert.throws(() => api.uploadConfig(doc('<p>Sign in</p>'), 'poster', { type: 'movie' }), /Sign in/);
   assert.throws(() => api.uploadConfig(doc(fixture('tv-poster.html')), 'poster', { type: 'movie' }), /unexpected/);
+  const incomplete = doc(fixture('movie-poster.html'));
+  incomplete.querySelector('.image_cropper').removeAttribute('data-aspect-ratio');
+  assert.throws(() => api.uploadConfig(incomplete, 'poster', { type: 'movie' }), /missing required settings/);
 });
 
 test('center cropping respects maximum size, exact ratio and no upscaling', t => {
@@ -578,13 +602,19 @@ test('ambiguous upload failure cannot be retried with the same confirmation', as
 });
 
 test('language-only retry never sends the image again', async t => {
-  let failures = 1;
+  let failures = 2;
   const env = mockApp(t, async url => { if (url.endsWith('/language') && failures-- > 0) throw new Error('Language offline'); });
   const upload = await addPreview(env); upload.click(); await tick(); await tick();
   const retry = [...env.app.panel.querySelectorAll('button')].find(b => b.textContent === 'Retry language only');
   assert.ok(retry); retry.click(); await tick(); await tick();
   assert.equal(env.calls.filter(c => c.url === '/image').length, 1);
   assert.equal(env.calls.filter(c => c.url.endsWith('/language')).length, 2);
+  assert.equal(upload.disabled, true);
+  assert.equal(retry.disabled, false);
+  assert.match(env.app.panel.textContent, /Image is already uploaded. Language update failed/);
+  retry.click(); await tick(); await tick();
+  assert.equal(env.calls.filter(c => c.url === '/image').length, 1);
+  assert.equal(env.calls.filter(c => c.url.endsWith('/language')).length, 3);
   assert.equal(upload.disabled, true); assert.match(env.app.panel.textContent, /language updated/);
 });
 

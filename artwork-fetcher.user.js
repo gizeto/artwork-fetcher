@@ -83,7 +83,8 @@
   const slug = s => normalize(s).replace(/ /g, '-').slice(0, 100).replace(/-$/, '') || 'unknown-title';
   function exactMatch(title, target) {
     const key = value => normalize(value).replace(/ /g, '');
-    return !!key(target.title) && key(title.title) === key(target.title) &&
+    const targetKey = key(target.title);
+    return !!targetKey && key(title.title) === targetKey &&
       /^\d{4}$/.test(String(target.year)) && String(title.year) === String(target.year);
   }
   function regions(value) {
@@ -119,14 +120,18 @@
     }
     const keep = new URLSearchParams();
     if (u.searchParams.has('playableId')) keep.set('playableId', u.searchParams.get('playableId'));
-    u.search = keep.toString(); u.hash = '';
+    u.search = keep.toString();
+    u.hash = '';
     return u.href;
   }
   function isTitleLink(url) {
-    const u = new URL(url);
-    if (provider(url) === 'Kanopy') return /^(?:\/[a-z]{2})?\/product\/[a-z\d-]+\/?$/i.test(u.pathname);
-    return provider(url) === 'Apple TV' ? /\/(movie|show)\/[^/]+\/umc\./.test(u.pathname) :
-      /\/(?:detail|dp|product)\/[^/]+/.test(u.pathname);
+    const { pathname } = new URL(url);
+    switch (provider(url)) {
+      case 'Kanopy': return /^(?:\/[a-z]{2})?\/product\/[a-z\d-]+\/?$/i.test(pathname);
+      case 'Apple TV': return /\/(movie|show)\/[^/]+\/umc\./.test(pathname);
+      case 'Amazon': return /\/(?:detail|dp|product)\/[^/]+/.test(pathname);
+      default: return false;
+    }
   }
   function manualSource(value) {
     const text = String(value).trim().replace(/[),.;]+$/, '');
@@ -184,29 +189,45 @@
       .replace(/\s*(?:[-|–—:]\s*)?(?:Amazon(?:\.com)?(?:\s+Prime)?\s+Video|Prime\s*Video|Apple\s*TV)(?:\s*[-|–—:]?\s*\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)?\s*$/i, '')
       .replace(/^Watch\s+/i, '').trim().slice(0, 300);
   }
+  function titlePageId(url) {
+    return new URL(url).pathname.split('/').filter(Boolean).pop();
+  }
+  function amazonHeaders(doc) {
+    const node = doc.querySelector('#dv-web-page-hydration-data');
+    if (!node) return {};
+    return JSON.parse(node.textContent).init?.preparations?.body?.atf?.state?.detail?.headerDetail || {};
+  }
+  function appleTitleItems(doc, pageURL) {
+    const node = doc.querySelector('#serialized-server-data');
+    if (!node) return [];
+    const id = titlePageId(pageURL);
+    const entries = JSON.parse(node.textContent).data || [];
+    return entries.flatMap(entry => {
+      const page = entry?.data;
+      if (!page?.canonicalURL || titlePageId(page.canonicalURL) !== id) return [];
+      return (page.shelves || []).flatMap(shelf => shelf.items || []);
+    }).filter(item => item.$kind === 'SuperheroLockup');
+  }
   function providerMetadata(doc, pageURL) {
     const year = value => String(value || '').match(/\b(?:18|19|20|21)\d{2}\b/)?.[0] || '';
-    const id = new URL(pageURL).pathname.split('/').filter(Boolean).pop();
     if (provider(pageURL) === 'Amazon') {
-      const node = doc.querySelector('#dv-web-page-hydration-data');
-      if (node) {
-        const headers = JSON.parse(node.textContent).init?.preparations?.body?.atf?.state?.detail?.headerDetail || {};
-        const entry = headers[id] || (Object.keys(headers).length === 1 ? Object.values(headers)[0] : null);
-        if (entry?.title) return { title: entry.title, year: year(entry.releaseYear) || year(entry.releaseDate),
-          type: entry.titleType === 'movie' ? 'Movie' : entry.titleType ? 'TV series' : '' };
+      const headers = amazonHeaders(doc);
+      const entry = headers[titlePageId(pageURL)] || (Object.keys(headers).length === 1 ? Object.values(headers)[0] : null);
+      if (entry?.title) {
+        return {
+          title: entry.title,
+          year: year(entry.releaseYear) || year(entry.releaseDate),
+          type: entry.titleType === 'movie' ? 'Movie' : entry.titleType ? 'TV series' : '',
+        };
       }
     } else if (provider(pageURL) === 'Apple TV') {
-      const node = doc.querySelector('#serialized-server-data');
-      if (node) {
-        for (const entry of JSON.parse(node.textContent).data || []) {
-          const page = entry?.data;
-          if (!page?.canonicalURL || new URL(page.canonicalURL).pathname.split('/').filter(Boolean).pop() !== id) continue;
-          for (const shelf of page.shelves || []) for (const item of shelf.items || []) {
-            if (item.$kind !== 'SuperheroLockup' || !item.title) continue;
-            return { title: item.title, year: (item.badgeRowMetadata || []).map(String).find(s => /^\d{4}$/.test(s)) || year(item.releaseDate),
-              type: item.type === 'Movie' || item.primaryMetadata?.includes('Movie') ? 'Movie' : 'TV series' };
-          }
-        }
+      const item = appleTitleItems(doc, pageURL).find(item => item.title);
+      if (item) {
+        return {
+          title: item.title,
+          year: (item.badgeRowMetadata || []).map(String).find(value => /^\d{4}$/.test(value)) || year(item.releaseDate),
+          type: item.type === 'Movie' || item.primaryMetadata?.includes('Movie') ? 'Movie' : 'TV series',
+        };
       }
     }
     // Only title-level structured data, never a search snippet's crawl date or recommendations.
@@ -242,9 +263,9 @@
           const name = provider(rawURL);
           const url = canonicalProvider(rawURL);
           if (!isTitleLink(url)) continue;
-          const found = item.sources.find(s => s.url === url);
-          if (found) { if (!found.countries.includes(country)) found.countries.push(country); }
-          else item.sources.push({ url, provider: name, countries: [country] });
+          const found = item.sources.find(source => source.url === url);
+          if (!found) item.sources.push({ url, provider: name, countries: [country] });
+          else if (!found.countries.includes(country)) found.countries.push(country);
         }
       }
     }
@@ -268,16 +289,10 @@
   }
   function amazonArtwork(doc, kind) {
     const assets = [];
-    const script = doc.querySelector('#dv-web-page-hydration-data');
-    if (script) {
-      const data = JSON.parse(script.textContent);
-      const detail = data.init?.preparations?.body?.atf?.state?.detail;
-      const headers = Object.values(detail?.headerDetail || {});
-      // headerDetail contains the current title; never traverse recommendation collections.
-      for (const header of headers) {
-        const image = header.images?.[kind === 'backdrop' ? 'heroshot' : 'packshot'];
-        if (image && isImageURL(image)) assets.push({ title: header.title, url: image, variants: amazonVariants(image) });
-      }
+    // headerDetail contains the current title; never traverse recommendation collections.
+    for (const header of Object.values(amazonHeaders(doc))) {
+      const image = header.images?.[kind === 'backdrop' ? 'heroshot' : 'packshot'];
+      if (image && isImageURL(image)) assets.push({ title: header.title, url: image, variants: amazonVariants(image) });
     }
     if (!assets.length && kind === 'backdrop') {
       const hero = doc.querySelector('[data-automation-id="hero-background"]');
@@ -288,31 +303,19 @@
     return assets;
   }
   function appleArtwork(doc, kind, pageURL) {
-    const node = doc.querySelector('#serialized-server-data');
-    if (!node) return [];
-    const data = JSON.parse(node.textContent);
     const assets = [];
-    for (const entry of data.data || []) {
-      const page = entry?.data;
-      if (!page?.canonicalURL || !page.shelves) continue;
-      const id = new URL(pageURL).pathname.split('/').pop();
-      if (new URL(page.canonicalURL).pathname.split('/').pop() !== id) continue;
-      for (const shelf of page.shelves) {
-        for (const item of shelf.items || []) {
-          if (item.$kind !== 'SuperheroLockup') continue;
-          const art = item.artwork?.[kind === 'backdrop' ? 'wide' : 'tall'];
-          if (!art?.template || !(art.width > 0 && art.height > 0)) continue;
-          const url = art.template.replaceAll('{w}', art.width).replaceAll('{h}', art.height).replaceAll('{f}', 'jpg');
-          if (isImageURL(url)) assets.push({ title: item.title, url, variants: [url] });
-        }
-      }
+    for (const item of appleTitleItems(doc, pageURL)) {
+      const art = item.artwork?.[kind === 'backdrop' ? 'wide' : 'tall'];
+      if (!art?.template || !(art.width > 0 && art.height > 0)) continue;
+      const url = art.template.replaceAll('{w}', art.width).replaceAll('{h}', art.height).replaceAll('{f}', 'jpg');
+      if (isImageURL(url)) assets.push({ title: item.title, url, variants: [url] });
     }
     return assets;
   }
   function kanopyAPI(pageURL, webshopId = 9) {
     const source = manualSource(pageURL);
     if (source.provider !== 'Kanopy') throw new Error('Not a Kanopy title page.');
-    const alias = new URL(source.url).pathname.split('/').filter(Boolean).pop();
+    const alias = titlePageId(source.url);
     return 'https://www.kanopy.com/kapi/videos/alias/' + encodeURIComponent(alias) + '?webshopId=' + encodeURIComponent(webshopId);
   }
   async function fetchKanopy(pageURL, kind, request, signal) {
@@ -357,34 +360,65 @@
     return unique;
   }
   function uploadConfig(doc, kind, target) {
-    const el = doc.querySelector('.image_cropper');
-    if (!el) throw new Error('TMDB upload form unavailable. Sign in to TMDB and try again.');
-    const d = el.dataset;
-    if (d.imageKind !== kind || d.mediaType !== (target.type === 'movie' ? 'Movie' : 'TvSeries')) throw new Error('TMDB returned an unexpected upload form.');
-    const ratio = d.aspectRatio.split('/').map(Number);
-    const config = { mediaId: d.mediaId, mediaType: d.mediaType, kind, token: d.csrfToken,
-      minWidth: +d.minCropWidth, minHeight: +d.minCropHeight, maxWidth: +d.maxCropWidth, maxHeight: +d.maxCropHeight,
-      ratioWidth: ratio[0], ratioHeight: ratio[1] };
-    if (!config.mediaId || !config.token || [config.minWidth, config.minHeight, config.maxWidth, config.maxHeight,
-      config.ratioWidth, config.ratioHeight].some(n => !Number.isFinite(n) || n <= 0)) throw new Error('TMDB upload form is missing required settings.');
+    const cropper = doc.querySelector('.image_cropper');
+    if (!cropper) throw new Error('TMDB upload form unavailable. Sign in to TMDB and try again.');
+    const settings = cropper.dataset;
+    const mediaType = target.type === 'movie' ? 'Movie' : 'TvSeries';
+    if (settings.imageKind !== kind || settings.mediaType !== mediaType) {
+      throw new Error('TMDB returned an unexpected upload form.');
+    }
+    const [ratioWidth, ratioHeight] = (settings.aspectRatio || '').split('/').map(Number);
+    const config = {
+      mediaId: settings.mediaId,
+      mediaType,
+      kind,
+      token: settings.csrfToken,
+      minWidth: Number(settings.minCropWidth),
+      minHeight: Number(settings.minCropHeight),
+      maxWidth: Number(settings.maxCropWidth),
+      maxHeight: Number(settings.maxCropHeight),
+      ratioWidth,
+      ratioHeight,
+    };
+    const dimensions = [config.minWidth, config.minHeight, config.maxWidth, config.maxHeight, ratioWidth, ratioHeight];
+    if (!config.mediaId || !config.token || dimensions.some(value => !Number.isFinite(value) || value <= 0)) {
+      throw new Error('TMDB upload form is missing required settings.');
+    }
     return config;
   }
-  function cropPlan(width, height, c) {
-    const scale = Math.min(width / c.ratioWidth, height / c.ratioHeight);
-    const cropWidth = scale * c.ratioWidth, cropHeight = scale * c.ratioHeight;
-    const unit = Math.floor(Math.min(scale, c.maxWidth / c.ratioWidth, c.maxHeight / c.ratioHeight));
-    const outputWidth = unit * c.ratioWidth, outputHeight = unit * c.ratioHeight;
-    return { x: (width - cropWidth) / 2, y: (height - cropHeight) / 2, cropWidth, cropHeight,
-      width: outputWidth, height: outputHeight, valid: outputWidth >= c.minWidth && outputHeight >= c.minHeight };
+  function cropPlan(width, height, config) {
+    const { ratioWidth, ratioHeight, minWidth, minHeight, maxWidth, maxHeight } = config;
+    const scale = Math.min(width / ratioWidth, height / ratioHeight);
+    const cropWidth = scale * ratioWidth;
+    const cropHeight = scale * ratioHeight;
+    const unit = Math.floor(Math.min(scale, maxWidth / ratioWidth, maxHeight / ratioHeight));
+    const outputWidth = unit * ratioWidth;
+    const outputHeight = unit * ratioHeight;
+    return {
+      x: (width - cropWidth) / 2,
+      y: (height - cropHeight) / 2,
+      cropWidth,
+      cropHeight,
+      width: outputWidth,
+      height: outputHeight,
+      valid: outputWidth >= minWidth && outputHeight >= minHeight,
+    };
   }
   function filename(target, kind) {
     return `${Math.floor(Date.now() / 1000)}_${slug(target.title)}${target.year ? '-' + target.year : ''}_${kind === 'backdrop' ? 'bg' : 'poster'}.jpg`;
   }
-  function multipart(blob, name, c) {
+  function multipart(blob, name, config) {
     const data = new root.FormData();
     data.append('upload_files', blob, name);
-    for (const [key, value] of Object.entries({ media_id: c.mediaId, media_type: c.mediaType, type: c.kind,
-      translate: 'false', crop_area: '', authenticity_token: c.token })) data.append(key, value);
+    const fields = {
+      media_id: config.mediaId,
+      media_type: config.mediaType,
+      type: config.kind,
+      translate: 'false',
+      crop_area: '',
+      authenticity_token: config.token,
+    };
+    for (const [key, value] of Object.entries(fields)) data.append(key, value);
     return data;
   }
   function uploadResult(json) {
@@ -438,10 +472,14 @@
   async function decode(blob) {
     const url = root.URL.createObjectURL(blob);
     try {
-      const image = new root.Image(); image.src = url;
+      const image = new root.Image();
+      image.src = url;
       await image.decode();
       return { image, width: image.naturalWidth, height: image.naturalHeight, close: () => root.URL.revokeObjectURL(url) };
-    } catch (_) { root.URL.revokeObjectURL(url); throw new Error('Cannot decode source image. Use a browser with AVIF support.'); }
+    } catch (_) {
+      root.URL.revokeObjectURL(url);
+      throw new Error('Cannot decode source image. Use a browser with AVIF support.');
+    }
   }
   async function prepare(asset, config, signal) {
     let best, lastError;
@@ -449,19 +487,30 @@
       if (!isImageURL(url)) continue;
       try {
         const decoded = await decode(await crossRequest(url, { blob: true, signal }));
-        if (!best || decoded.width * decoded.height >= best.width * best.height) { best?.close(); best = decoded; }
-        else decoded.close();
+        if (!best || decoded.width * decoded.height >= best.width * best.height) {
+          best?.close();
+          best = decoded;
+        } else {
+          decoded.close();
+        }
       } catch (e) { lastError = e; }
-      if (signal?.aborted) { best?.close(); throw new Error('Cancelled.'); }
+      if (signal?.aborted) {
+        best?.close();
+        throw new Error('Cancelled.');
+      }
     }
     if (!best) throw lastError || new Error('No downloadable artwork.');
     try {
       const crop = cropPlan(best.width, best.height, config);
       if (!crop.valid) throw new Error(`Source ${best.width}×${best.height} is too small after cropping (minimum ${config.minWidth}×${config.minHeight}).`);
-      const canvas = root.document.createElement('canvas'); canvas.width = crop.width; canvas.height = crop.height;
+      const canvas = root.document.createElement('canvas');
+      canvas.width = crop.width;
+      canvas.height = crop.height;
       const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(best.image, crop.x, crop.y, crop.cropWidth, crop.cropHeight, 0, 0, crop.width, crop.height);
       const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
       if (!blob || blob.type !== 'image/jpeg') throw new Error('JPEG conversion failed.');
@@ -475,7 +524,9 @@
     return el;
   }
   function button(text, action) {
-    const b = element('button', text, { type: 'button' }); b.addEventListener('click', action); return b;
+    const control = element('button', text, { type: 'button' });
+    control.addEventListener('click', action);
+    return control;
   }
   function link(text, href) { return element('a', text, { href, target: '_blank', rel: 'noopener noreferrer' }); }
   const CSS = `
@@ -507,11 +558,18 @@
 
   class App {
     constructor(target, deps = {}) {
-      this.target = target; this.request = deps.request || tmdbRequest; this.cross = deps.cross || crossRequest;
-      this.prepare = deps.prepare || prepare; this.waf = deps.waf || waf;
-      this.urls = []; this.jobs = []; this.busy = false;
-      this.host = element('div', null, { id: 'tmdb-artwork' }); this.host.style.cssText = 'position:relative;z-index:2147483646';
-      this.shadow = this.host.attachShadow({ mode: 'open' }); this.shadow.append(element('style', CSS));
+      this.target = target;
+      this.request = deps.request || tmdbRequest;
+      this.cross = deps.cross || crossRequest;
+      this.prepare = deps.prepare || prepare;
+      this.waf = deps.waf || waf;
+      this.urls = [];
+      this.jobs = [];
+      this.busy = false;
+      this.host = element('div', null, { id: 'tmdb-artwork' });
+      this.host.style.cssText = 'position:relative;z-index:2147483646';
+      this.shadow = this.host.attachShadow({ mode: 'open' });
+      this.shadow.append(element('style', CSS));
       const toolbar = element('div', null, { class: 'toolbar' });
       toolbar.append(button('Fetch background', () => this.open('backdrop')), button('Fetch poster', () => this.open('poster')), button('Settings', () => this.settings()));
       this.shadow.append(toolbar); root.document.body.append(this.host);
@@ -519,13 +577,26 @@
     }
     cleanup() {
       this.controller?.abort();
-      this.urls.forEach(url => root.URL.revokeObjectURL(url)); this.urls = [];
-      for (const job of this.jobs) { root.clearTimeout(job.timer); root.clearTimeout(job.attentionTimer); job.tab?.close?.(); GM_removeValueChangeListener(job.listener); GM_deleteValue(PREFIX + job.id); }
+      this.urls.forEach(url => root.URL.revokeObjectURL(url));
+      this.urls = [];
+      for (const job of this.jobs) {
+        root.clearTimeout(job.timer);
+        root.clearTimeout(job.attentionTimer);
+        job.tab?.close?.();
+        GM_removeValueChangeListener(job.listener);
+        GM_deleteValue(PREFIX + job.id);
+      }
       this.jobs = [];
+    }
+    newRequest() {
+      this.cleanup();
+      this.controller = new root.AbortController();
+      return this.controller.signal;
     }
     shell(title) {
       if (this.busy) return false;
-      this.cleanup(); this.overlay?.remove(); this.controller = new root.AbortController();
+      this.newRequest();
+      this.overlay?.remove();
       this.overlay = element('div', null, { class: 'overlay' });
       this.panel = element('div', null, { class: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
       const header = element('div', null, { class: 'dialog-header' });
@@ -591,9 +662,10 @@
     }
     async search(query) {
       if (this.busy) return;
-      this.cleanup(); this.controller = new root.AbortController();
-      const signal = this.controller.signal; const results = this.results; const status = this.status;
-      results.replaceChildren(); status.textContent = 'Searching JustWatch…';
+      const signal = this.newRequest();
+      const { results, status } = this;
+      results.replaceChildren();
+      status.textContent = 'Searching JustWatch…';
       const responses = [], errors = [];
       const countries = GM_getValue('regions', ['US']);
       await Promise.all(countries.map(async country => {
@@ -739,11 +811,17 @@
     }
     async fetchTitle(title) {
       if (this.busy) return;
-      this.cleanup(); this.controller = new root.AbortController();
-      const signal = this.controller.signal; const results = this.results; const status = this.status;
-      results.replaceChildren(); status.textContent = 'Reading TMDB image limits…';
+      const signal = this.newRequest();
+      const { results, status } = this;
+      results.replaceChildren();
+      status.textContent = 'Reading TMDB image limits…';
       let config;
-      try { config = await this.config(signal); } catch (e) { if (!signal.aborted) status.textContent = e.message; return; }
+      try {
+        config = await this.config(signal);
+      } catch (e) {
+        if (!signal.aborted) status.textContent = e.message;
+        return;
+      }
       if (signal.aborted) return;
       status.textContent = 'Fetching artwork. Each card previews the exact JPEG that will be uploaded.';
       for (const source of title.sources) {
@@ -799,8 +877,13 @@
     lock(value) {
       this.busy = value;
       for (const control of this.shadow.querySelectorAll('button,input,select')) {
-        if (value) { control.dataset.wasDisabled = String(control.disabled); control.disabled = true; }
-        else { control.disabled = control.dataset.wasDisabled === 'true'; delete control.dataset.wasDisabled; }
+        if (value) {
+          control.dataset.wasDisabled = String(control.disabled);
+          control.disabled = true;
+        } else {
+          control.disabled = control.dataset.wasDisabled === 'true';
+          delete control.dataset.wasDisabled;
+        }
       }
     }
     async language(id, value, config) {
@@ -810,46 +893,69 @@
       const response = await this.request(`/image/${id}/language`, { body });
       if (response.success !== true) throw new Error(response.message || 'Language update failed.');
     }
+    languageRetry(id, value, mediaId, state) {
+      const retry = button('Retry language only', async () => {
+        if (this.busy) return;
+        this.lock(true);
+        try {
+          const config = await this.config();
+          if (config.mediaId !== mediaId) throw new Error('TMDB returned a different title. Reload the correct gallery.');
+          await this.language(id, value, config);
+          state.textContent = 'Uploaded; language updated.';
+          retry.remove();
+        } catch (e) {
+          state.textContent = `Image is already uploaded. Language update failed: ${e.message}`;
+        } finally {
+          this.lock(false);
+        }
+      });
+      return retry;
+    }
     async upload(prepared, name, language, originalConfig, block, uploadButton) {
       if (this.busy || uploadButton.dataset.submitted || this.controller?.signal.aborted || !block.isConnected) return;
-      const state = element('p', '', { role: 'status' }); block.append(state);
-      if (!/^[a-z]{2,3}-[A-Z]{2}$/.test(language)) { state.textContent = 'Choose a language tag such as en-US, or xx-XX for no language.'; return; }
+      const state = element('p', '', { role: 'status' });
+      block.append(state);
+      if (!/^[a-z]{2,3}-[A-Z]{2}$/.test(language)) {
+        state.textContent = 'Choose a language tag such as en-US, or xx-XX for no language.';
+        return;
+      }
       this.lock(true);
       let attempted = false;
       try {
         state.textContent = 'Checking the upload session…';
         const config = await this.config();
-        if (config.mediaId !== originalConfig.mediaId || prepared.crop.width < config.minWidth || prepared.crop.height < config.minHeight ||
-          prepared.crop.width > config.maxWidth || prepared.crop.height > config.maxHeight ||
-          config.ratioWidth !== originalConfig.ratioWidth || config.ratioHeight !== originalConfig.ratioHeight) throw new Error('TMDB form settings changed. Fetch artwork again before uploading.');
+        const { width, height } = prepared.crop;
+        const sameForm = config.mediaId === originalConfig.mediaId &&
+          config.ratioWidth === originalConfig.ratioWidth && config.ratioHeight === originalConfig.ratioHeight;
+        const outsideLimits = width < config.minWidth || height < config.minHeight ||
+          width > config.maxWidth || height > config.maxHeight;
+        if (!sameForm || outsideLimits) {
+          throw new Error('TMDB form settings changed. Fetch artwork again before uploading.');
+        }
         await this.waf();
         state.textContent = 'Uploading the confirmed JPEG…';
-        attempted = true; uploadButton.dataset.submitted = 'true';
+        attempted = true;
+        uploadButton.dataset.submitted = 'true';
         const result = uploadResult(await this.request('/image', { body: multipart(prepared.blob, name, config) }));
         state.textContent = result.processing ? 'Uploaded; TMDB is processing the image.' : 'Uploaded successfully.';
         block.append(link('View TMDB gallery', `${TMDB}${this.target.path}/images/${config.kind === 'backdrop' ? 'backdrops' : 'posters'}`));
-        if (!result.id) { state.textContent += ' The response did not include an image ID; set its language in the gallery.'; return; }
+        if (!result.id) {
+          state.textContent += ' The response did not include an image ID; set its language in the gallery.';
+          return;
+        }
         try { await this.language(result.id, language, config); }
         catch (e) {
           state.textContent += ` Language was not updated: ${e.message}`;
-          const retry = button('Retry language only', async () => {
-            if (this.busy) return;
-            this.lock(true);
-            try {
-              const fresh = await this.config();
-              if (fresh.mediaId !== config.mediaId) throw new Error('TMDB returned a different title. Reload the correct gallery.');
-              await this.language(result.id, language, fresh); state.textContent = 'Uploaded; language updated.'; retry.remove();
-            }
-            catch (err) { state.textContent = `Image is already uploaded. Language update failed: ${err.message}`; }
-            finally { this.lock(false); uploadButton.disabled = true; }
-          });
-          block.append(retry);
+          block.append(this.languageRetry(result.id, language, config.mediaId, state));
         }
       } catch (e) {
         state.textContent = attempted ? `${e.message} The image may already have reached TMDB. Check the gallery before starting another upload.` : e.message;
       } finally {
         this.lock(false);
-        if (attempted) { uploadButton.disabled = true; uploadButton.textContent = 'Submission sent'; }
+        if (attempted) {
+          uploadButton.disabled = true;
+          uploadButton.textContent = 'Submission sent';
+        }
       }
     }
     sourceTab(source, card, config, signal, opener) {
@@ -900,10 +1006,13 @@
     // Providers can redirect a title to a different slug. Keep the job bound to its
     // source origin, a title route, and the unguessable request ID in the fragment.
     if (!job || job.state !== 'waiting' || job.expires < Date.now() || new URL(job.url).origin !== root.location.origin) return;
-    const searching = job.mode === 'search';
-    if (searching ? root.location.origin !== 'https://www.google.com' || root.location.pathname !== '/search' ||
-      new URL(job.url).searchParams.get('q') !== new URL(root.location.href).searchParams.get('q') : !isTitleLink(root.location.href)) return;
-    if (searching) { googleHelper(job, key); return; }
+    if (job.mode === 'search') {
+      if (root.location.origin !== 'https://www.google.com' || root.location.pathname !== '/search' ||
+        new URL(job.url).searchParams.get('q') !== new URL(root.location.href).searchParams.get('q')) return;
+      googleHelper(job, key);
+      return;
+    }
+    if (!isTitleLink(root.location.href)) return;
     const host = element('div'); host.style.cssText = 'position:relative;z-index:2147483647';
     const shadow = host.attachShadow({ mode: 'open' }); shadow.append(element('style', CSS));
     const toolbar = element('div', null, { class: 'toolbar' }); const state = element('span');

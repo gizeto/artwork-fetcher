@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM } = require('jsdom');
 const { createCanvas, loadImage } = require('@napi-rs/canvas');
-const source = fs.readFileSync(path.join(__dirname, '../tmdb-artwork.user.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../artwork-fetcher.user.js'), 'utf8');
 const fixture = name => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8');
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
 
@@ -19,6 +19,7 @@ function environment(t, html = '', url = 'https://www.themoviedb.org/movie/15085
   w.GM_listValues = () => [...stored.keys()];
   w.GM_addValueChangeListener = () => 1;
   w.GM_removeValueChangeListener = () => {};
+  w.GM_openInTab = () => ({ close() {} });
   w.URL.createObjectURL = blob => { const key = 'blob:test-' + objectURLs.size; objectURLs.set(key, blob); return key; };
   w.URL.revokeObjectURL = key => objectURLs.delete(key);
   w.eval(source);
@@ -244,13 +245,17 @@ test('one failed provider does not discard another provider preview', async t =>
   assert.equal(calls.filter(c => c.body).length, 0);
 });
 
-test('Kanopy fetch uses its destination session and retains the upload confirmation gate', async t => {
+test('Kanopy performs an anonymous visitor handshake and retains the upload confirmation gate', async t => {
   const env = mockApp(t); const { app, calls } = env;
   const reads = [];
-  app.cross = async (url, options) => { reads.push({ url, options }); return fixture('kanopy.json'); };
+  app.cross = async (url, options) => { reads.push({ url, options }); return fixture(url.endsWith('/handshake') ? 'kanopy-handshake.json' : 'kanopy.json'); };
   await app.fetchTitle({ sources: [app.target && env.api.manualSource('https://www.kanopy.com/en/product/justwatch-16504352')] });
-  assert.equal(reads.length, 1); assert.equal(reads[0].options.anonymous, false);
-  assert.match(reads[0].url, /\/kapi\/videos\/alias\/justwatch-16504352\?webshopId=9$/);
+  assert.equal(reads.length, 2); assert.ok(reads.every(r => r.options.anonymous));
+  assert.match(reads[0].url, /\/kapi\/handshake$/);
+  assert.equal(reads[0].options.headers.Authorization, undefined);
+  assert.equal(reads[1].options.headers.Authorization, 'Bearer synthetic-visitor-token');
+  assert.match(reads[1].url, /\/kapi\/videos\/alias\/justwatch-16504352\?webshopId=9$/);
+  assert.equal(env.stored.size, 0);
   assert.equal(app.results.querySelectorAll('img').length, 1);
   assert.equal(calls.filter(c => c.body).length, 0);
 });
@@ -279,12 +284,278 @@ test('Kanopy API denial offers a source tab; helper sends only artwork metadata 
   const helper = environment(t, '', url + '#tmdb-artwork=' + id);
   helper.stored.set('tmdb-artwork-job:' + id, { id, url, kind: 'poster', state: 'waiting', expires: Date.now() + 60000 });
   const reads = [];
-  helper.w.fetch = async (url, options) => { reads.push({ url, options }); return { ok: true, json: async () => JSON.parse(fixture('kanopy.json')) }; };
+  helper.w.fetch = async (url, options) => { reads.push({ url, options }); return { ok: true, text: async () => fixture(url.endsWith('/handshake') ? 'kanopy-handshake.json' : 'kanopy.json') }; };
   helper.api.helper(); helper.w.document.body.lastElementChild.shadowRoot.querySelector('button').click(); await tick();
-  assert.equal(reads.length, 1); assert.equal(reads[0].options.credentials, 'same-origin');
+  assert.equal(reads.length, 2); assert.equal(reads[0].options.credentials, 'same-origin');
+  assert.equal(reads[1].options.headers.Authorization, 'Bearer synthetic-visitor-token');
   const result = helper.stored.get('tmdb-artwork-job:' + id);
   assert.equal(result.state, 'ready'); assert.match(result.assets[0].url, /static-assets.kanopy.com/);
   assert.equal(result.video, undefined); assert.equal(result.cookies, undefined);
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-visitor-token/);
+});
+
+test('Kanopy validates initialization, uses the returned region, and stops on cancellation', async t => {
+  const { api, w } = environment(t);
+  const url = 'https://www.kanopy.com/en/product/justwatch-16504352';
+  let calls = 0;
+  await assert.rejects(api.fetchKanopy(url, 'poster', async () => { calls++; return '{}'; }), /initialization failed/);
+  assert.equal(calls, 1);
+  const controller = new w.AbortController();
+  await assert.rejects(api.fetchKanopy(url, 'poster', async () => {
+    controller.abort(); return fixture('kanopy-handshake.json');
+  }, controller.signal), /Cancelled/);
+  await api.fetchKanopy(url, 'poster', async (url, options) => {
+    if (url.endsWith('/handshake')) return JSON.stringify({ jwt: 'fake', webshopId: 12 });
+    assert.match(url, /webshopId=12$/); assert.equal(options.headers.Authorization, 'Bearer fake');
+    return fixture('kanopy.json');
+  });
+});
+
+test('cross-origin transport forwards visitor headers and omits cookies', async t => {
+  const { api, w } = environment(t);
+  let options;
+  w.GM_xmlhttpRequest = input => {
+    options = input; queueMicrotask(() => input.onload({ status: 200, responseText: '{}' })); return { abort() {} };
+  };
+  await api.crossRequest('https://www.kanopy.com/kapi/handshake', { headers: { 'X-Version': 'test' } });
+  assert.equal(options.anonymous, true); assert.equal(options.headers['X-Version'], 'test');
+});
+
+test('Google parsing accepts title links, unwraps redirects, deduplicates storefronts, and filters media type', t => {
+  const { api, doc } = environment(t);
+  const results = api.googleResults(doc(fixture('google.html')), 'movie');
+  assert.equal(results.length, 2);
+  assert.equal(results[0].sources[0].provider, 'Amazon');
+  assert.equal(results[1].sources[0].provider, 'Apple TV');
+  assert.match(results[1].title, /Bigfoot/);
+  assert.equal(api.googleResults(doc('<p>Enable JavaScript / consent / challenge</p>'), 'movie').length, 0);
+  assert.equal(api.googleResults(doc(fixture('google.html')), 'tv').filter(r => r.sources[0].provider === 'Apple TV').length, 1);
+  assert.equal(new URL(api.googleQueries('Bigfoot, I Love You')[0]).searchParams.get('q'), 'Bigfoot, I Love You prime video');
+});
+
+test('Google title cleanup separates provider labels and relative crawl dates', t => {
+  const { api, doc } = environment(t);
+  const url = 'https://www.primevideo.com/detail/B012345678';
+  const results = api.googleResults(doc(`<a href="${url}"><h3>The Possessed<span>Prime Video</span><span>1 month ago</span></h3></a>`), 'movie');
+  assert.equal(results[0].title, 'The Possessed');
+  assert.equal(api.cleanGoogleTitle('Watch Flatball - A History of Ultimate - Apple TV'), 'Flatball - A History of Ultimate');
+  assert.equal(api.cleanGoogleTitle('A Movie from 1984'), 'A Movie from 1984');
+});
+
+test('provider metadata reads captured release years only from the current title', t => {
+  const { api, doc } = environment(t);
+  const amazon = 'https://www.amazon.com/gp/video/detail/B0FVFQ9Q5B';
+  const apple = 'https://tv.apple.com/gb/movie/flatball/umc.cmc.drnve62utn2ny5vtx4jlq8e6';
+  for (const [file, url] of [['amazon-metadata.html', amazon], ['apple-metadata.html', apple]]) {
+    const result = api.providerMetadata(doc(fixture(file)), url);
+    assert.equal(result.title, 'Flatball - A History of Ultimate'); assert.equal(result.year, '2017'); assert.equal(result.type, 'Movie');
+  }
+  assert.throws(() => api.providerMetadata(doc(fixture('apple-metadata.html')), apple + '-wrong'), /unavailable/);
+  const noYear = api.providerMetadata(doc(fixture('amazon.html')), amazon);
+  assert.equal(noYear.year, '');
+  const ld = '<script type="application/ld+json">' + JSON.stringify({ '@type': 'Movie', name: 'The Possessed', datePublished: '1965-07-24', url: amazon }) + '</script>';
+  assert.equal(api.providerMetadata(doc(ld), amazon).year, '1965');
+  assert.throws(() => api.providerMetadata(doc(ld.replace('B0FVFQ9Q5B', 'B012345678')), amazon), /unavailable/);
+  assert.throws(() => api.providerMetadata(doc('<p>Movie recommendation 2020 · crawled 2026</p>'), amazon), /unavailable/);
+});
+
+test('Google cards enrich titles and years, highlight matches, and show one deduplicated count below results', async t => {
+  const { app, calls, w } = mockApp(t);
+  app.target = { ...app.target, title: 'Flatball: A History of Ultimate', year: '2017' };
+  const amazon = 'https://www.amazon.com/gp/video/detail/B0FVFQ9Q5B';
+  const apple = 'https://tv.apple.com/gb/movie/flatball/umc.cmc.drnve62utn2ny5vtx4jlq8e6';
+  const search = `<a href="${amazon}"><h3>FlatballPrime Video1 month ago</h3></a><a href="${apple}"><h3>Flatball - Apple TV</h3></a>`;
+  const reads = [];
+  app.cross = async url => {
+    reads.push(url);
+    if (url.includes('justwatch')) return '{}';
+    if (url.includes('google.com')) return search;
+    return fixture(url === amazon ? 'amazon-metadata.html' : 'apple-metadata.html');
+  };
+  await app.search(app.target.title);
+  assert.equal(reads.filter(url => url === amazon).length, 1); assert.equal(reads.filter(url => url === apple).length, 1);
+  const section = app.results.querySelector('.google-section');
+  assert.equal(section.querySelector('.google-heading').textContent, 'Google Search fallback');
+  assert.doesNotMatch(section.textContent, /No exact JustWatch match|Check the title|month ago/);
+  assert.equal(section.querySelectorAll('.google-card.exact-match').length, 2);
+  for (const card of section.querySelectorAll('.google-card')) {
+    assert.equal(card.querySelector('strong').textContent, 'Flatball - A History of Ultimate');
+    assert.match(card.querySelector('.google-meta').textContent, /Movie · 2017$/);
+    assert.equal(card.querySelector('.match-label').hidden, false);
+    assert.equal(card.querySelector('.google-actions').children.length, 2);
+  }
+  const summary = section.querySelector('.google-summary');
+  assert.equal(summary.textContent, '2 provider pages found'); assert.equal(section.lastElementChild, summary);
+  assert.ok(section.querySelector('.grid').compareDocumentPosition(summary) & w.Node.DOCUMENT_POSITION_FOLLOWING);
+  assert.equal(calls.length, 0);
+
+  app.cross = async url => {
+    if (url.includes('justwatch')) return '{}';
+    if (url.includes('google.com')) return search;
+    if (url === amazon) throw new Error('HTTP 403');
+    return fixture('apple-metadata.html').replace('2017', '2016');
+  };
+  await app.search(app.target.title);
+  assert.equal(app.results.querySelectorAll('.google-card').length, 2);
+  assert.equal(app.results.querySelectorAll('.google-card.exact-match').length, 0);
+  assert.match(app.results.textContent, /Year unknown/); assert.match(app.results.textContent, /Movie · 2016/);
+  assert.equal(app.results.querySelector('.google-summary').textContent, '2 provider pages found');
+  assert.equal(calls.length, 0);
+});
+
+test('cancelling Google provider enrichment ignores late metadata and never highlights or uploads', async t => {
+  const { app, calls } = mockApp(t);
+  const release = [];
+  app.cross = async url => {
+    if (url.includes('justwatch')) return '{}';
+    if (url.includes('google.com')) return fixture('google.html');
+    return new Promise(resolve => release.push(resolve));
+  };
+  const pending = app.search('Bigfoot'); await tick();
+  const before = app.results.textContent;
+  app.close.click(); release.forEach(resolve => resolve(fixture('amazon-metadata.html'))); await pending;
+  assert.equal(app.results.querySelectorAll('.exact-match').length, 0);
+  assert.doesNotMatch(app.results.textContent, /Flatball/);
+  assert.match(before, /Reading year/); assert.equal(calls.length, 0);
+});
+
+test('Google fallback handles empty or unrelated JustWatch matches and requires source selection before preview', async t => {
+  const env = mockApp(t); const { app, calls } = env;
+  let jw = '{"data":{"searchTitles":{"edges":[]}}}'; const reads = [];
+  app.cross = async url => {
+    reads.push(url);
+    if (url.includes('justwatch')) return jw;
+    if (url.includes('google.com')) return fixture('google.html');
+    return fixture('apple-unavailable.html');
+  };
+  await app.search('Bigfoot, I Love You');
+  assert.equal(app.results.querySelectorAll('button').length, 2); // Two deduplicated sources; no manual Google step.
+  assert.equal(app.results.querySelectorAll('img').length, 0); assert.equal(calls.length, 0);
+  jw = fixture('justwatch.json');
+  await app.search('Bigfoot, I Love You');
+  assert.equal(reads.filter(url => url.includes('google.com')).length, 4);
+  const apple = [...app.results.querySelectorAll('.google-card')].find(card => card.querySelector('.google-meta')?.textContent.includes('Apple TV'));
+  apple.querySelector('button').click(); await tick(); await tick();
+  assert.equal(app.results.querySelectorAll('img').length, 1);
+  assert.equal(calls.filter(c => c.body).length, 0);
+});
+
+test('an exact usable JustWatch match skips Google; missing offers triggers it', async t => {
+  const { app } = mockApp(t); let searches = 0;
+  const data = JSON.parse(fixture('justwatch.json'));
+  app.cross = async url => {
+    if (url.includes('google.com')) { searches++; return ''; }
+    return JSON.stringify(data);
+  };
+  await app.search('Flatball: A History of Ultimate'); assert.equal(searches, 0);
+  for (const { node } of data.data.searchTitles.edges) node.offers = [];
+  await app.search('Flatball: A History of Ultimate'); assert.equal(searches, 2);
+  assert.match(app.results.textContent, /Searching in a background tab/);
+});
+
+test('Google errors retain readable results; closing aborts late search output', async t => {
+  const { app, calls } = mockApp(t);
+  app.cross = async url => {
+    if (url.includes('justwatch')) throw new Error('JustWatch unavailable');
+    if (new URL(url).searchParams.get('q').endsWith('prime video')) throw new Error('HTTP 429');
+    return fixture('google.html');
+  };
+  await app.search('Bigfoot');
+  assert.match(app.results.textContent, /Bigfoot, I Love You/);
+  assert.match(app.results.textContent, /Searching in a background tab/);
+  const releases = [];
+  app.cross = async url => url.includes('justwatch') ? '{}' : new Promise(resolve => { releases.push(resolve); });
+  const pending = app.search('Another title'); await tick();
+  app.close.click(); releases.forEach(resolve => resolve(fixture('google.html'))); await pending;
+  assert.equal(app.results.querySelectorAll('button').length, 0);
+  assert.equal(calls.filter(c => c.body).length, 0);
+});
+
+test('Google background exchange is automatic, request-specific, closes tabs, and never uploads artwork', async t => {
+  const env = mockApp(t); const { app, w, stored, calls } = env;
+  const tabs = [], listeners = new Map();
+  w.GM_openInTab = (url, options) => {
+    const tab = { url, options, closed: false, close() { this.closed = true; } }; tabs.push(tab); return tab;
+  };
+  w.GM_addValueChangeListener = (key, callback) => { listeners.set(key, callback); return listeners.size; };
+  app.cross = async () => '{}'; await app.search('Bigfoot, I Love You');
+  assert.equal(app.jobs.length, 2); assert.equal(tabs.length, 2); assert.ok(tabs.every(tab => !tab.options.active));
+  const opened = tabs[0].url;
+  const key = [...stored.keys()].find(k => k.startsWith('tmdb-artwork-job:'));
+  const helper = environment(t, fixture('google.html'), opened);
+  helper.stored.set(key, stored.get(key)); helper.api.start();
+  const result = helper.stored.get(key);
+  assert.equal(result.state, 'ready'); assert.equal(result.titles.length, 2); assert.equal(result.assets, undefined);
+  await listeners.get(key)(key, null, result);
+  assert.match(app.results.textContent, /Bigfoot, I Love You/);
+  assert.equal(tabs[0].closed, true);
+  assert.equal(calls.length, 0);
+  const expired = environment(t, fixture('google.html'), opened);
+  expired.stored.set(key, { ...result, state: 'waiting', expires: Date.now() - 1 }); expired.api.start();
+  assert.equal(expired.stored.has(key), false);
+  const wrong = environment(t, fixture('google.html'), opened.replace('Bigfoot', 'Different'));
+  wrong.stored.set(key, { ...result, state: 'waiting' }); wrong.api.helper();
+  assert.equal(wrong.stored.get(key).state, 'waiting');
+  app.close.click(); assert.equal(tabs[1].closed, true); assert.equal(stored.has(key), false);
+  const before = app.results.textContent;
+  [...listeners.values()][1]('unused', null, result); assert.equal(app.results.textContent, before);
+});
+
+test('Google helper collects delayed results without a click and ignores cancelled or changed searches', async t => {
+  const id = '11111111-1111-4111-8111-111111111111', key = 'tmdb-artwork-job:' + id;
+  const url = 'https://www.google.com/search?q=Bigfoot';
+  for (const scenario of ['results', 'cancel', 'navigate']) {
+    const env = environment(t, '<p>Loading…</p>', url + '#tmdb-artwork=' + id);
+    env.stored.set(key, { id, url, mode: 'search', type: 'movie', state: 'waiting', expires: Date.now() + 60000 });
+    env.api.start();
+    if (scenario === 'cancel') env.stored.delete(key);
+    if (scenario === 'navigate') env.w.history.replaceState(null, '', '/search?q=SomethingElse');
+    env.w.document.body.innerHTML = fixture('google.html');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(env.stored.get(key)?.state, scenario === 'results' ? 'ready' : scenario === 'cancel' ? undefined : 'waiting');
+  }
+});
+
+test('Google attention recovery opens only on request, and pending background tabs expire', async t => {
+  const { app, w, stored, calls } = mockApp(t);
+  const timers = [], tabs = [];
+  w.setTimeout = (fn, delay) => { timers.push({ fn, delay }); return timers.length; };
+  w.clearTimeout = () => {};
+  w.GM_openInTab = (url, options) => {
+    const tab = { options, closed: false, close() { this.closed = true; } }; tabs.push(tab); return tab;
+  };
+  app.cross = async () => '{}'; await app.search('Bigfoot');
+  assert.ok(tabs.every(tab => !tab.options.active));
+  timers.find(timer => timer.delay === 20000).fn();
+  const recover = [...app.results.querySelectorAll('button')].find(b => b.textContent === 'Open Google to resolve');
+  assert.ok(recover); recover.click(); assert.equal(tabs[0].closed, true); assert.equal(tabs[2].options.active, true);
+  timers.filter(timer => timer.delay === 600000).forEach(timer => timer.fn());
+  assert.ok(tabs.every(tab => tab.closed)); assert.equal(stored.size, 0);
+  recover.click(); assert.equal(tabs.length, 3); assert.equal(calls.length, 0);
+});
+
+test('exact-match highlighting requires the TMDB title and known year; popup uses an accessible corner close', async t => {
+  const env = mockApp(t); const { app, api, w } = env;
+  const target = { title: "It's: A Test!", year: '2020' };
+  assert.equal(api.exactMatch({ title: 'ITS A TEST', year: 2020 }, target), true);
+  for (const item of [{ title: 'ITS A TEST', year: 2021 }, { title: 'ITS A TEST' }, { title: 'Test', year: 2020 }]) {
+    assert.equal(api.exactMatch(item, target), false);
+  }
+  assert.equal(api.exactMatch({ title: 'Test' }, { title: 'Test' }), false);
+  app.cross = async () => JSON.stringify({ data: { searchTitles: { edges: [
+    { node: { id: '1', objectType: 'MOVIE', content: { title: 'FOUR, BIRDS!', originalReleaseYear: 2026 }, offers: [] } },
+    { node: { id: '2', objectType: 'MOVIE', content: { title: 'Four Birds', originalReleaseYear: 2025 }, offers: [] } },
+  ] } } });
+  app.open('poster'); await tick();
+  const details = app.panel.querySelector('details');
+  assert.ok(app.results.compareDocumentPosition(details) & w.Node.DOCUMENT_POSITION_FOLLOWING);
+  assert.equal(app.results.querySelectorAll('.exact-match').length, 1);
+  assert.match(app.results.querySelector('.exact-match').textContent, /Title & year match/);
+  await app.search('Different edited query');
+  assert.equal(app.results.querySelectorAll('.exact-match').length, 1); // Still compares with TMDB.
+  assert.equal(app.close.getAttribute('aria-label'), 'Close'); assert.equal(app.close.textContent, '×');
+  assert.equal(app.close.parentElement.className, 'dialog-header');
+  app.close.click(); assert.equal(app.overlay.isConnected, false);
 });
 
 test('closing a preview and cancelling search never upload', async t => {
@@ -368,7 +639,7 @@ test('real JPEG encoding preserves center crop and chooses larger source without
   const config = api.uploadConfig(doc(fixture('movie-poster.html')), 'poster', { type: 'movie' });
   const result = await api.prepare({ variants: ['https://m.media-amazon.com/test.jpg', 'https://m.media-amazon.com/test._SX4096_FMavif_PQ100_.jpg'] }, config, new w.AbortController().signal);
   const bytes = Buffer.from(await result.blob.arrayBuffer());
-  assert.equal(bytes.subarray(0, 3).toString('hex'), 'ffd8ff'); assert.equal(quality, 1);
+  assert.equal(bytes.subarray(0, 3).toString('hex'), 'ffd8ff'); assert.equal(quality, 0.9);
   const image = await loadImage(bytes); assert.equal(image.width, 2000); assert.equal(image.height, 3000);
   assert.equal(result.sourceWidth, 2400); assert.equal(result.sourceHeight, 3200);
   assert.equal(objectURLs.size, 0);

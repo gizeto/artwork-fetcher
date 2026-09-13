@@ -1,5 +1,5 @@
 {
-  "name": "tmdb-artwork-userscript",
+  "name": "artwork-fetcher",
   "private": true,
   "scripts": {
     "test": "node --test tests/*.test.cjs"

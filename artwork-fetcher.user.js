@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         artwork-fetcher
+// @name         TMDB Artwork Fetcher
 // @namespace    https://github.com/gizeto/artwork-fetcher
 // @version      1.4.1
 // @author       gizeto

@@ -219,6 +219,61 @@ async function addPreview(env) {
   return [...card.querySelectorAll('button')].find(b => b.textContent === 'Upload this image');
 }
 
+test('typing a language stays inside the popup and leaves normal keyboard behavior available', async t => {
+  const env = mockApp(t);
+  const { app, w, calls } = env;
+  await addPreview(env);
+  const language = app.panel.querySelector('[aria-label="Image language"]');
+  const pageKeys = [];
+  const inputKeys = [];
+  for (const type of ['keydown', 'keypress', 'keyup']) {
+    w.document.addEventListener(type, event => pageKeys.push(event.key));
+    language.addEventListener(type, event => inputKeys.push(event.key));
+  }
+  language.focus();
+  for (const key of ['e', 'Tab', 'ArrowDown']) {
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      const event = new w.KeyboardEvent(type, { key, bubbles: true, composed: true, cancelable: true });
+      language.dispatchEvent(event);
+      assert.equal(event.defaultPrevented, false, 'typing, tabbing, and datalist navigation must remain available');
+    }
+  }
+  assert.equal(inputKeys.length, 9);
+  assert.deepEqual(pageKeys, [], 'TMDB shortcuts must not receive keys typed into the popup');
+  assert.equal(calls.length, 0, 'typing must not submit an image');
+
+  w.document.body.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'e', bubbles: true }));
+  assert.deepEqual(pageKeys, ['e'], 'page shortcuts still work outside the popup');
+});
+
+test('isolating popup keyboard events preserves Enter actions in search and provider fields', t => {
+  const { app, w, stored } = mockApp(t);
+  const queries = [];
+  const titles = [];
+  const pageKeys = [];
+  app.search = query => queries.push(query);
+  app.fetchTitle = title => titles.push(title);
+  w.document.addEventListener('keydown', event => pageKeys.push(event.key));
+  app.open('poster');
+  queries.length = 0;
+
+  const search = app.panel.querySelector('[aria-label="Search title"]');
+  search.value = 'A Night to Regret';
+  search.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, composed: true }));
+  assert.deepEqual(queries, ['A Night to Regret']);
+
+  const provider = app.panel.querySelector('[aria-label="Provider title URL"]');
+  provider.value = 'https://www.amazon.com/gp/video/detail/B012345678';
+  provider.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, composed: true }));
+  assert.equal(titles[0].sources[0].url, provider.value);
+  assert.deepEqual(Array.from(stored.get(`direct-sources:${app.target.type}:${app.target.id}`)), [provider.value]);
+
+  app.settings();
+  const regions = app.panel.querySelector('[aria-label="JustWatch regions"]');
+  regions.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'e', bubbles: true, composed: true }));
+  assert.deepEqual(pageKeys, []);
+});
+
 test('preview is local; only a confirmation click uploads; double-click cannot duplicate it', async t => {
   const env = mockApp(t); const { app, calls } = env;
   const upload = await addPreview(env);

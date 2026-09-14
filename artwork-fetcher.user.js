@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMDB Artwork Fetcher
 // @namespace    https://github.com/gizeto/artwork-fetcher
-// @version      1.4.2
+// @version      1.4.3
 // @author       gizeto
 // @homepageURL  https://github.com/gizeto/artwork-fetcher
 // @supportURL   https://github.com/gizeto/artwork-fetcher/issues
@@ -569,6 +569,12 @@
       this.host = element('div', null, { id: 'tmdb-artwork' });
       this.host.style.cssText = 'position:relative;z-index:2147483646';
       this.shadow = this.host.attachShadow({ mode: 'open' });
+      // Outside the shadow root, keyboard events appear to come from the host
+      // div, so TMDB's shortcuts cannot recognize typing in our fields. Let
+      // local handlers and native editing run, but keep these events off the page.
+      for (const type of ['keydown', 'keypress', 'keyup']) {
+        this.shadow.addEventListener(type, event => event.stopPropagation());
+      }
       this.shadow.append(element('style', CSS));
       const toolbar = element('div', null, { class: 'toolbar' });
       toolbar.append(button('Fetch background', () => this.open('backdrop')), button('Fetch poster', () => this.open('poster')), button('Settings', () => this.settings()));

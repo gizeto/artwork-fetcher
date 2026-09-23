@@ -15,6 +15,13 @@ The script searches JustWatch first, then Google for `<title> prime video` and
 deduplicated candidates requiring selection. Pasted provider URLs also work and
 are remembered per TMDB title.
 
+Version 1.5 also lets users run these Google queries manually alongside JustWatch
+results. Search and provider metadata are reused for 15 minutes across reloads.
+Arbitrary HTTP(S) URLs can supply a direct image or static HTML image candidates;
+the largest decoded image of the requested orientation that meets TMDB crop limits
+is selected. Generic extraction does not execute page scripts or crawl linked pages
+or stylesheets. Existing provider handlers remain the preferred path for title URLs.
+
 Google's HTTP response may require JavaScript. The script then uses a temporary
 background tab, observes rendered links, returns them automatically, and closes
 the tab. Consent/CAPTCHA still needs user action. This uses

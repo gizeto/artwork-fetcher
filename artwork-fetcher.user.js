@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         TMDB Artwork Fetcher
 // @namespace    https://github.com/gizeto/artwork-fetcher
-// @version      1.4.3
+// @version      1.5.0
 // @author       gizeto
 // @homepageURL  https://github.com/gizeto/artwork-fetcher
 // @supportURL   https://github.com/gizeto/artwork-fetcher/issues
 // @downloadURL  https://raw.githubusercontent.com/gizeto/artwork-fetcher/main/artwork-fetcher.user.js
 // @updateURL    https://raw.githubusercontent.com/gizeto/artwork-fetcher/main/artwork-fetcher.user.js
-// @description  Find Amazon, Apple and Kanopy artwork, preview a JPEG, and confirm its upload to TMDB.
+// @description  Find provider or webpage artwork, preview a JPEG, and confirm its upload to TMDB.
 // @match        https://www.themoviedb.org/movie/*
 // @match        https://www.themoviedb.org/tv/*
 // @match        https://www.amazon.com/*
@@ -49,6 +49,7 @@
 // @connect      mzstatic.com
 // @connect      kanopy.com
 // @connect      static-assets.kanopy.com
+// @connect      *
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -70,6 +71,70 @@
     'amazon.com.mx', 'amazon.pl', 'primevideo.com']);
   const TTL = 10 * 60 * 1000;
   const PREFIX = 'tmdb-artwork-job:';
+  const CACHE_PREFIX = 'tmdb-artwork-cache:v1:';
+  const CACHE_TTL = 15 * 60 * 1000;
+  class Cache {
+    constructor() { this.blobs = new Map(); }
+    records() {
+      const now = Date.now(), records = [];
+      for (const key of GM_listValues()) {
+        if (!key.startsWith(CACHE_PREFIX)) continue;
+        const entry = GM_getValue(key);
+        if (!entry || entry.version !== 1 || !(entry.expires > now)) GM_deleteValue(key);
+        else records.push({ key, entry, size: JSON.stringify(entry).length * 2 });
+      }
+      return records;
+    }
+    get(key) {
+      try {
+        const entry = GM_getValue(CACHE_PREFIX + key);
+        if (entry?.version === 1 && entry.expires > Date.now()) return entry.value;
+        if (entry) GM_deleteValue(CACHE_PREFIX + key);
+      } catch (_) { /* Storage is optional. */ }
+    }
+    set(key, value, signal) {
+      if (signal?.aborted) return;
+      try {
+        const entry = { version: 1, created: Date.now(), expires: Date.now() + CACHE_TTL, value };
+        const size = JSON.stringify(entry).length * 2;
+        if (size > 5 * 1024 * 1024) return;
+        const storageKey = CACHE_PREFIX + key;
+        const records = this.records().filter(r => r.key !== storageKey).sort((a, b) => a.entry.created - b.entry.created);
+        let total = records.reduce((sum, r) => sum + r.size, size);
+        while (records.length >= 200 || total > 5 * 1024 * 1024) {
+          const oldest = records.shift(); total -= oldest.size; GM_deleteValue(oldest.key);
+        }
+        GM_setValue(storageKey, entry);
+      } catch (_) { /* Keep fetching if storage is full or unavailable. */ }
+    }
+    getBlob(url) {
+      for (const [key, entry] of this.blobs) if (entry.expires <= Date.now()) this.blobs.delete(key);
+      return this.blobs.get(url)?.blob;
+    }
+    setBlob(url, blob, signal) {
+      if (signal?.aborted || blob.size > 50 * 1024 * 1024) return;
+      this.getBlob(url); this.blobs.delete(url);
+      let total = [...this.blobs.values()].reduce((sum, e) => sum + e.blob.size, blob.size);
+      while (total > 50 * 1024 * 1024) {
+        const key = this.blobs.keys().next().value;
+        total -= this.blobs.get(key).blob.size; this.blobs.delete(key);
+      }
+      this.blobs.set(url, { blob, expires: Date.now() + CACHE_TTL });
+    }
+    clear() {
+      this.blobs.clear();
+      try { for (const key of GM_listValues()) if (key.startsWith(CACHE_PREFIX)) GM_deleteValue(key); }
+      catch (_) { /* Storage may be disabled. */ }
+    }
+  }
+  function checkCancelled(signal) { if (signal?.aborted) throw new Error('Cancelled.'); }
+  function webURL(value, base) {
+    try {
+      const url = new URL(value, base);
+      if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password) return url.href;
+    } catch (_) { /* Invalid URL. */ }
+    return null;
+  }
   const QUERY = `query GetSearchResults($country: Country!, $language: Language!, $first: Int!, $searchQuery: String, $location: String!) {
     searchTitles(country: $country, first: $first, filter: {searchQuery: $searchQuery, includeTitlesWithoutUrl: true}, source: $location) {
       edges { node { id objectType content(country: $country, language: $language) { title originalReleaseYear fullPath }
@@ -134,24 +199,18 @@
     }
   }
   function manualSource(value) {
-    const text = String(value).trim().replace(/[),.;]+$/, '');
+    const text = String(value).trim();
+    if (!webURL(text)) throw new Error('Paste an HTTP or HTTPS image or webpage URL without credentials.');
     const name = provider(text);
-    if (!name) throw new Error('Paste an HTTPS title-page URL from Amazon/Prime Video, Apple TV, or Kanopy.');
-    const parsed = new URL(text);
-    if (parsed.username || parsed.password) throw new Error('Provider links must not contain credentials.');
-    const url = canonicalProvider(text);
-    if (!isTitleLink(url)) throw new Error('Use a movie or TV title page, not a provider homepage or search page.');
-    return { url, provider: name, countries: ['Direct link'] };
+    const canonical = name && canonicalProvider(text.replace(/[),.;]+$/, ''));
+    if (canonical && isTitleLink(canonical)) {
+      return { url: canonical, provider: name, countries: ['Direct link'] };
+    }
+    return { url: text, provider: new URL(text).hostname, generic: true, countries: ['Direct link'] };
   }
-  function discoveryLinks(title, country) {
-    const storefront = country.toLowerCase();
-    const term = encodeURIComponent(title);
-    return [
-      ['Search Apple TV', `https://tv.apple.com/${storefront}/search?term=${term}`],
-      ['Search Prime Video', `https://www.primevideo.com/search?phrase=${term}`],
-      ['Find indexed Apple pages', 'https://www.google.com/search?q=' + encodeURIComponent(`"${title}" site:tv.apple.com`)],
-      ['Find indexed Amazon pages', 'https://www.google.com/search?q=' + encodeURIComponent(`"${title}" (site:primevideo.com OR site:amazon.com)`)],
-    ];
+  function discoveryLinks(title, target) {
+    const query = target.type === 'tv' ? `${title} tv show online` : [title, target.year, 'online'].filter(Boolean).join(' ');
+    return [['Search Google for streaming options', 'https://www.google.com/search?q=' + encodeURIComponent(query)]];
   }
   function googleQueries(title) {
     return ['prime video', 'apple tv'].map(provider =>
@@ -171,6 +230,7 @@
         }
         if (!['Amazon', 'Apple TV'].includes(provider(url.href))) continue;
         const source = manualSource(url.href);
+        if (source.generic) continue;
         const heading = anchor.querySelector('h3, [role="heading"]');
         const titleNode = heading?.cloneNode(true) || anchor.cloneNode(true);
         titleNode.querySelectorAll('cite, time, script, style, [aria-hidden="true"]').forEach(node => node.remove());
@@ -319,6 +379,9 @@
     return 'https://www.kanopy.com/kapi/videos/alias/' + encodeURIComponent(alias) + '?webshopId=' + encodeURIComponent(webshopId);
   }
   async function fetchKanopy(pageURL, kind, request, signal) {
+    return kanopyArtwork(await kanopyData(pageURL, request, signal), kind, pageURL);
+  }
+  async function kanopyData(pageURL, request, signal) {
     // The public client performs this visitor handshake before reading metadata.
     // Keep the anonymous JWT in memory and send it only to Kanopy's API.
     const headers = { Accept: 'application/json', 'X-Version': 'web/undefined/undefined/undefined' };
@@ -330,7 +393,8 @@
     const data = JSON.parse(await request(kanopyAPI(pageURL, session.webshopId), {
       signal, anonymous: true, headers: { ...headers, Authorization: 'Bearer ' + session.jwt },
     }));
-    return kanopyArtwork(data, kind, pageURL);
+    checkCancelled(signal);
+    return data;
   }
   function kanopyArtwork(data, kind, pageURL) {
     const video = data?.video;
@@ -358,6 +422,62 @@
     const unique = [...new Map(result.map(a => [a.url, a])).values()];
     if (!unique.length) throw new Error('No title artwork found. The page may require a challenge or sign-in.');
     return unique;
+  }
+  function pageImages(doc, pageURL) {
+    const base = webURL(doc.querySelector('base[href]')?.getAttribute('href') || pageURL, pageURL) || pageURL;
+    const urls = new Set();
+    const add = value => {
+      if (typeof value !== 'string' || !value.trim()) return;
+      const url = webURL(value.trim(), base); if (url) urls.add(url);
+    };
+    const srcset = value => {
+      // Consume URL tokens first: commas inside an URL are legal in srcset.
+      let rest = value || '';
+      while (rest.trim()) {
+        rest = rest.replace(/^[\s,]+/, '');
+        const token = rest.match(/^\S+/)?.[0]; if (!token) break;
+        add(token.replace(/,+$/, '')); rest = rest.slice(token.length);
+        if (!token.endsWith(',')) rest = rest.replace(/^[^,]*(?:,|$)/, '');
+      }
+    };
+    for (const node of doc.querySelectorAll('img, picture source')) {
+      for (const attr of ['src', 'data-src', 'data-original', 'data-lazy-src', 'data-lazy', 'data-url']) add(node.getAttribute(attr));
+      for (const attr of ['srcset', 'data-srcset', 'data-lazy-srcset']) srcset(node.getAttribute(attr));
+    }
+    for (const node of doc.querySelectorAll('meta[property], meta[name]')) {
+      if (/^(?:og:image(?::(?:url|secure_url))?|twitter:image(?::src)?)$/i.test(node.getAttribute('property') || node.getAttribute('name'))) add(node.content);
+    }
+    for (const node of doc.querySelectorAll('link[rel="image_src"]')) add(node.getAttribute('href'));
+    for (const node of doc.querySelectorAll('[style]')) {
+      for (const declaration of node.getAttribute('style').split(';')) {
+        if (!/^\s*background(?:-image)?\s*:/i.test(declaration)) continue;
+        for (const match of declaration.matchAll(/url\(\s*(?:"([^"]+)"|'([^']+)'|([^\s)]+))\s*\)/g)) add(match[1] || match[2] || match[3]);
+      }
+    }
+    const imageValue = value => {
+      if (typeof value === 'string') add(value);
+      else if (Array.isArray(value)) value.forEach(imageValue);
+      else if (value && typeof value === 'object') { add(value.url); add(value.contentUrl); }
+    };
+    const walk = value => {
+      if (!value || typeof value !== 'object') return;
+      if (value['@type'] === 'ImageObject') imageValue(value);
+      for (const [key, item] of Object.entries(value)) {
+        if (['image', 'thumbnailUrl', 'thumbnail', 'associatedMedia'].includes(key)) imageValue(item);
+        if (item && typeof item === 'object') walk(item);
+      }
+    };
+    for (const script of doc.querySelectorAll('script[type="application/ld+json"]')) {
+      try { walk(JSON.parse(script.textContent)); } catch (_) { /* Malformed structured data. */ }
+    }
+    return [...urls];
+  }
+  async function blobText(blob) {
+    if (blob.text) return blob.text();
+    return new Promise((resolve, reject) => {
+      const reader = new root.FileReader(); reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Cannot read page response.')); reader.readAsText(blob);
+    });
   }
   function uploadConfig(doc, kind, target) {
     const cropper = doc.querySelector('.image_cropper');
@@ -429,7 +549,7 @@
     return { id: /^[a-f\d]{24}$/i.test(id || '') ? id : null,
       processing: card?.classList.contains('processing') || false };
   }
-  function crossRequest(url, { json, blob = false, signal, anonymous = true, headers = {} } = {}) {
+  function crossRequest(url, { json, blob = false, detailed = false, signal, anonymous = true, headers = {} } = {}) {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error('Cancelled.'));
       const finish = (fn, value) => { signal?.removeEventListener('abort', abort); fn(value); };
@@ -440,7 +560,8 @@
         data: json ? JSON.stringify(json) : undefined, responseType: blob ? 'blob' : 'text', timeout: 30000,
         onload: r => {
           if (r.status < 200 || r.status >= 300) return finish(reject, new Error(`Source returned HTTP ${r.status}.`));
-          finish(resolve, blob ? r.response : r.responseText);
+          const body = blob ? r.response : r.responseText;
+          finish(resolve, detailed ? { body, contentType: r.responseHeaders?.match(/^content-type:\s*([^\r\n]+)/im)?.[1] || '', finalURL: r.finalUrl || url } : body);
         }, onerror: () => finish(reject, new Error('Source request failed. Check Tampermonkey host permissions.')),
         ontimeout: () => finish(reject, new Error('Source request timed out.')),
         onabort: () => finish(reject, new Error('Cancelled.')) });
@@ -478,15 +599,15 @@
       return { image, width: image.naturalWidth, height: image.naturalHeight, close: () => root.URL.revokeObjectURL(url) };
     } catch (_) {
       root.URL.revokeObjectURL(url);
-      throw new Error('Cannot decode source image. Use a browser with AVIF support.');
+      throw new Error('Cannot decode source image. The response may not be an image, or its format may be unsupported by your browser.');
     }
   }
-  async function prepare(asset, config, signal) {
+  async function prepare(asset, config, signal, download = (url, signal) => crossRequest(url, { blob: true, signal })) {
     let best, lastError;
     for (const url of asset.variants) {
-      if (!isImageURL(url)) continue;
+      if (!(asset.generic ? webURL(url) : isImageURL(url))) continue;
       try {
-        const decoded = await decode(await crossRequest(url, { blob: true, signal }));
+        const decoded = await decode(asset.blob && url === asset.url ? asset.blob : await download(url, signal));
         if (!best || decoded.width * decoded.height >= best.width * best.height) {
           best?.close();
           best = decoded;
@@ -561,8 +682,12 @@
       this.target = target;
       this.request = deps.request || tmdbRequest;
       this.cross = deps.cross || crossRequest;
-      this.prepare = deps.prepare || prepare;
+      this.cache = deps.cache || new Cache();
+      this.pending = new Map();
+      this.decode = deps.decode || decode;
+      this.prepare = deps.prepare || ((asset, config, signal) => prepare(asset, config, signal, (url, active) => this.download(url, active)));
       this.waf = deps.waf || waf;
+      this.kind = 'backdrop';
       this.urls = [];
       this.jobs = [];
       this.busy = false;
@@ -577,9 +702,103 @@
       }
       this.shadow.append(element('style', CSS));
       const toolbar = element('div', null, { class: 'toolbar' });
-      toolbar.append(button('Fetch background', () => this.open('backdrop')), button('Fetch poster', () => this.open('poster')), button('Settings', () => this.settings()));
+      toolbar.append(button('Fetch artwork', () => this.open()), button('Settings', () => this.settings()));
       this.shadow.append(toolbar); root.document.body.append(this.host);
       root.addEventListener('pagehide', () => this.cleanup(), { once: true });
+    }
+    async cached(key, signal, read) {
+      checkCancelled(signal);
+      const stored = this.cache.get(key);
+      if (stored !== undefined) return stored;
+      const existing = this.pending.get(key);
+      if (existing?.signal === signal) return existing.promise;
+      const entry = { signal };
+      entry.promise = (async () => {
+        const value = await read(); checkCancelled(signal);
+        this.cache.set(key, value, signal); return value;
+      })();
+      this.pending.set(key, entry);
+      try { return await entry.promise; }
+      finally { if (this.pending.get(key) === entry) this.pending.delete(key); }
+    }
+    async download(url, signal) {
+      checkCancelled(signal);
+      const saved = this.cache.getBlob(url); if (saved) return saved;
+      const blob = await this.cross(url, { blob: true, signal });
+      checkCancelled(signal);
+      // Decode before caching so error pages and unsupported files are retried.
+      const image = await this.decode(blob);
+      const dimensions = { width: image.width, height: image.height }; image.close(); checkCancelled(signal);
+      this.cache.set('dimensions:' + url, dimensions, signal);
+      this.cache.setBlob(url, blob, signal); return blob;
+    }
+    async providerRecord(source, signal) {
+      return this.cached('provider:' + source.url, signal, async () => {
+        const record = { artwork: {}, errors: {} };
+        const data = source.provider === 'Kanopy' ? await kanopyData(source.url, this.cross, signal) :
+          parse(await this.cross(source.url, { signal }));
+        checkCancelled(signal);
+        for (const kind of ['backdrop', 'poster']) {
+          try { record.artwork[kind] = source.provider === 'Kanopy' ? kanopyArtwork(data, kind, source.url) : extract(data, source.url, kind); }
+          catch (e) { record.errors[kind] = e.message; }
+        }
+        if (source.provider !== 'Kanopy') {
+          try { record.metadata = providerMetadata(data, source.url); } catch (_) { /* Artwork can exist without readable metadata. */ }
+        }
+        if (!record.metadata && !Object.keys(record.artwork).length) throw new Error(record.errors.backdrop);
+        return record;
+      });
+    }
+    async genericAssets(source, config, signal) {
+      const key = 'page:' + source.url;
+      const cachedPage = this.cache.get(key);
+      let page = cachedPage;
+      if (!page) {
+        const response = await this.cross(source.url, { blob: true, detailed: true, signal });
+        checkCancelled(signal);
+        const { body, contentType, finalURL } = response;
+        if (!webURL(finalURL)) throw new Error('Source redirected to an unsupported URL.');
+        const type = contentType || body.type || '';
+        if (!/html|xhtml/i.test(type)) {
+          try {
+            const decoded = await this.decode(body); decoded.close(); checkCancelled(signal);
+            this.cache.setBlob(source.url, body, signal);
+            this.cache.set(key, { image: true }, signal);
+            return [{ url: source.url, variants: [source.url], generic: true, blob: body }];
+          } catch (e) { checkCancelled(signal); if (/^image\//i.test(type)) throw e; }
+        }
+        const doc = parse(await blobText(body));
+        checkCancelled(signal);
+        if (/just a moment|access denied|verify you are human|captcha/i.test(doc.title)) throw new Error('This page requires a browser challenge. Paste a direct image URL instead.');
+        page = { candidates: pageImages(doc, finalURL) };
+      }
+      if (page.image) return [{ url: source.url, variants: [source.url], generic: true }];
+      const candidates = [...page.candidates]; let best;
+      await Promise.all(Array.from({ length: Math.min(3, candidates.length) }, async () => {
+        while (candidates.length && !signal.aborted) {
+          const url = candidates.shift();
+          try {
+            const blob = await this.download(url, signal);
+            let dimensions = this.cache.get('dimensions:' + url);
+            if (!dimensions) {
+              const decoded = await this.decode(blob);
+              dimensions = { width: decoded.width, height: decoded.height }; decoded.close();
+              this.cache.set('dimensions:' + url, dimensions, signal);
+            }
+            checkCancelled(signal);
+            const { width, height } = dimensions;
+            if (!(config.kind === 'poster' ? height > width : width > height) || !cropPlan(width, height, config).valid) continue;
+            const area = width * height, difference = Math.abs(width / height - config.ratioWidth / config.ratioHeight);
+            if (!best || area > best.area || (area === best.area && (difference < best.difference || (difference === best.difference && url < best.url)))) {
+              best = { url, area, difference, blob };
+            }
+          } catch (_) { /* One failed candidate must not hide other images. */ }
+        }
+      }));
+      checkCancelled(signal);
+      if (!best) throw new Error('No suitable image found for this orientation and TMDB size limits. Paste a direct image URL instead.');
+      if (!cachedPage) this.cache.set(key, page, signal);
+      return [{ url: best.url, variants: [best.url], generic: true, blob: best.blob }];
     }
     cleanup() {
       this.controller?.abort();
@@ -602,6 +821,7 @@
     shell(title) {
       if (this.busy) return false;
       this.newRequest();
+      this.discovery = null; this.previewing = false;
       this.overlay?.remove();
       this.overlay = element('div', null, { class: 'overlay' });
       this.panel = element('div', null, { class: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
@@ -617,30 +837,61 @@
       const input = element('input', null, { value: GM_getValue('regions', ['US']).join(', '), 'aria-label': 'JustWatch regions' });
       const status = element('p');
       this.panel.append(element('p', 'JustWatch countries, e.g. US, GB, PL. Searches combine the regions you enter.'), input,
-        button('Save regions', () => { try { GM_setValue('regions', regions(input.value)); status.textContent = 'Settings saved.'; } catch (e) { status.textContent = e.message; } }), status);
+        button('Save regions', () => { try { GM_setValue('regions', regions(input.value)); status.textContent = 'Settings saved.'; } catch (e) { status.textContent = e.message; } }),
+        button('Clear cache', () => { this.cache.clear(); status.textContent = 'Cache cleared. Saved regions and links were kept.'; }), status);
     }
-    open(kind) {
-      if (!this.shell(`${kind === 'backdrop' ? 'Background' : 'Poster'} · ${this.target.title}`)) return;
-      this.kind = kind;
+    open() {
+      if (!this.shell(`Artwork · ${this.target.title}`)) return;
+      this.kind = 'backdrop';
+      this.discovery = element('div'); this.panel.append(this.discovery);
       const row = element('div', null, { class: 'row' });
       const query = element('input', null, { value: this.target.title, 'aria-label': 'Search title' });
       const search = button('Search', () => this.search(query.value));
       query.addEventListener('keydown', e => { if (e.key === 'Enter') this.search(query.value); });
-      row.append(query, search); this.panel.append(row);
+      row.append(query, search, button('Search Google', () => this.manualGoogle(query.value))); this.discovery.append(row);
       this.status = element('p', '', { class: 'status', role: 'status' }); this.results = element('div', null, { class: 'grid' });
-      this.panel.append(this.status, this.results);
+      this.discovery.append(this.status, this.results);
       this.directControls(query);
       this.search(this.target.title);
     }
+    artworkButtons(title) {
+      return ['backdrop', 'poster'].map(kind => {
+        const control = button(kind === 'backdrop' ? 'Fetch background' : 'Fetch poster', () => this.fetchTitle(title, kind));
+        control.disabled = !title.sources.length; return control;
+      });
+    }
+    back() {
+      if (this.busy || !this.previewing) return;
+      this.newRequest(); this.previewing = false;
+      this.preview.remove(); this.preview = null;
+      this.discovery.hidden = false;
+      this.results = this.searchView.results; this.status = this.searchView.status;
+      // Interrupted Google searches can be explicitly retried without losing completed cards.
+      for (const section of this.results.querySelectorAll('.google-section[data-complete="false"]')) {
+        section.dataset.interrupted = 'true';
+        section.querySelector('.google-states').textContent = 'Search paused. Click Search Google to retry.';
+        for (const meta of section.querySelectorAll('.google-meta')) meta.textContent = meta.textContent.replace('Reading year…', 'Year unknown');
+      }
+      if (this.status.textContent === 'Searching JustWatch…') this.status.textContent = 'Search paused. Click Search to retry.';
+      this.panel.scrollTop = this.searchView.scroll;
+      this.searchView.focus?.focus({ preventScroll: true });
+    }
+    manualGoogle(query) {
+      if (this.busy || this.previewing) return;
+      return this.googleSearch(query, this.controller.signal, this.results);
+    }
     directControls(query) {
-      const section = element('details'); section.append(element('summary', 'No streaming link? Find or paste a provider page'));
-      section.append(element('p', 'An unavailable title may still have artwork. Search the provider or web index, then paste its title-page URL.'));
+      const section = element('details'); section.append(element('summary', 'Find or paste an image or webpage URL'));
+      section.append(element('p', 'Paste a provider page, direct image, or webpage. Webpages use the largest suitable image found in their HTML.'));
       const links = element('div', null, { class: 'row' });
       const refreshLinks = () => {
-        links.replaceChildren(...discoveryLinks(query.value || this.target.title, GM_getValue('regions', ['US'])[0]).map(([text, url]) => link(text, url)));
+        links.replaceChildren(...discoveryLinks(query.value || this.target.title, this.target).map(([text, url]) => link(text, url)));
       };
       query.addEventListener('input', refreshLinks); refreshLinks(); section.append(links);
-      const input = element('input', null, { type: 'url', placeholder: 'https://tv.apple.com/… or Amazon/Prime Video/Kanopy title URL', 'aria-label': 'Provider title URL' });
+      const input = element('input', null, { type: 'url', placeholder: 'https://… image or webpage URL', 'aria-label': 'Image or webpage URL' });
+      const kind = element('select', null, { 'aria-label': 'Artwork type' });
+      kind.append(element('option', 'Background', { value: 'backdrop' }), element('option', 'Poster', { value: 'poster' }));
+      kind.addEventListener('change', () => { this.kind = kind.value; }); this.directKind = kind;
       const row = element('div', null, { class: 'row' }); const state = element('p', '', { role: 'status' });
       const key = `direct-sources:${this.target.type}:${this.target.id}`;
       const saved = element('div', null, { class: 'row' });
@@ -649,7 +900,9 @@
         for (const url of GM_getValue(key, [])) {
           let source;
           try { source = manualSource(url); } catch (_) { continue; }
-          saved.append(button(`Fetch saved ${source.provider} link`, () => this.fetchTitle({ sources: [source] })));
+          const card = element('div', null, { class: 'card' });
+          const actions = element('div', null, { class: 'row' }); actions.append(...this.artworkButtons({ sources: [source] }));
+          card.append(link(`Saved ${source.provider} link`, source.url), actions); saved.append(card);
         }
       };
       const fetch = () => {
@@ -658,16 +911,16 @@
           const source = manualSource(input.value);
           const urls = [...new Set([...GM_getValue(key, []), source.url])].slice(-10);
           GM_setValue(key, urls); renderSaved(); state.textContent = '';
-          this.fetchTitle({ sources: [source] });
+          this.fetchTitle({ sources: [source] }, kind.value);
         } catch (e) { state.textContent = e.message; }
       };
-      row.append(input, button('Fetch from URL', fetch)); input.addEventListener('keydown', e => { if (e.key === 'Enter') fetch(); });
+      row.append(input, kind, button('Fetch from URL', fetch)); input.addEventListener('keydown', e => { if (e.key === 'Enter') fetch(); });
       section.append(row, state, saved, button('Forget saved links', () => { if (!this.busy) { GM_deleteValue(key); renderSaved(); } }));
       renderSaved(); if (saved.childElementCount) section.open = true;
-      this.panel.append(section);
+      (this.discovery || this.panel).append(section);
     }
     async search(query) {
-      if (this.busy) return;
+      if (this.busy || this.previewing) return;
       const signal = this.newRequest();
       const { results, status } = this;
       results.replaceChildren();
@@ -676,9 +929,13 @@
       const countries = GM_getValue('regions', ['US']);
       await Promise.all(countries.map(async country => {
         try {
-          const json = JSON.parse(await this.cross('https://apis.justwatch.com/graphql', { signal,
-            json: { operationName: 'GetSearchResults', query: QUERY, variables: { country, language: 'en', first: 10, searchQuery: query, location: 'SearchSuggester' } } }));
-          if (json.errors?.length) throw new Error(json.errors.map(x => x.message).join('; '));
+          const json = await this.cached('justwatch:' + JSON.stringify([query, country, 'en']), signal, async () => {
+            const data = JSON.parse(await this.cross('https://apis.justwatch.com/graphql', { signal,
+              json: { operationName: 'GetSearchResults', query: QUERY, variables: { country, language: 'en', first: 10, searchQuery: query, location: 'SearchSuggester' } } }));
+            if (data.errors?.length) throw new Error(data.errors.map(x => x.message).join('; '));
+            if (!Array.isArray(data.data?.searchTitles?.edges)) throw new Error('Invalid JustWatch response.');
+            return data;
+          });
           responses.push({ country, data: json });
         } catch (e) { errors.push(`${country}: ${e.message}`); }
       }));
@@ -688,8 +945,8 @@
       for (const title of titles) {
         const card = this.titleCard(title);
         card.append(element('strong', `${title.title} (${title.year || 'year unknown'})`), element('p', `${title.type} · ${title.countries.join(', ')} · ${title.sources.length} provider pages`));
-        const choose = button('Fetch artwork', () => this.fetchTitle(title)); choose.disabled = !title.sources.length;
-        card.append(choose); results.append(card);
+        const actions = element('div', null, { class: 'row' }); actions.append(...this.artworkButtons(title));
+        card.append(actions); results.append(card);
       }
       if (!titles.some(title => normalize(title.title) === normalize(query) && title.sources.length)) {
         await this.googleSearch(query, signal, results);
@@ -710,6 +967,8 @@
         if (seen.has(key)) continue;
         seen.add(key);
         const card = element('div', null, { class: 'card google-card' });
+        card.dataset.source = key;
+        card.dataset.enriched = 'false';
         const heading = element('strong', cleanGoogleTitle(title.title));
         const badge = element('span', 'Title & year match', { class: 'match-label' }); badge.hidden = true;
         const region = source.provider === 'Apple TV' ? new URL(source.url).pathname.split('/')[1].toUpperCase() : '';
@@ -717,18 +976,20 @@
         const meta = element('p', providerLine + ' · Reading year…', { class: 'google-meta' });
         const note = element('p', '', { class: 'google-note' }); note.hidden = true;
         const actions = element('div', null, { class: 'google-actions' });
-        actions.append(link('View provider page', source.url), button('Fetch artwork', () => this.fetchTitle(title)));
+        actions.append(link('View provider page', source.url), ...this.artworkButtons(title));
         card.append(heading, badge, meta, note, actions);
         container.append(card);
         pending.push(async () => {
           try {
-            const html = await this.cross(source.url, { signal });
+            const record = await this.providerRecord(source, signal);
             if (signal.aborted) return;
-            const metadata = providerMetadata(parse(html), source.url);
+            const metadata = record.metadata;
+            if (!metadata) throw new Error('Provider details unavailable.');
             Object.assign(title, metadata); heading.textContent = metadata.title;
             meta.textContent = [providerLine, metadata.type, metadata.year || 'Year unknown'].filter(Boolean).join(' · ');
             const matched = exactMatch(metadata, this.target);
             card.classList.toggle('exact-match', matched); badge.hidden = !matched;
+            card.dataset.enriched = 'true';
           } catch (_) {
             if (signal.aborted) return;
             meta.textContent = providerLine + ' · Year unknown';
@@ -743,25 +1004,46 @@
       }));
     }
     async googleSearch(query, signal, results) {
-      const section = element('div', null, { class: 'card google-section' });
-      section.append(element('strong', 'Google Search fallback', { class: 'google-heading' }));
-      const grid = element('div', null, { class: 'grid' });
-      const states = element('div'); const summary = element('p', '0 provider pages found', { class: 'google-summary', role: 'status' });
-      section.append(grid, states, summary); results.append(section);
-      const context = { seen: new Set(), signal, summary };
+      if (signal.aborted) return;
+      let section = [...results.querySelectorAll('.google-section')].find(node => node.dataset.query === query);
+      if (section && section.dataset.interrupted !== 'true') return;
+      if (!section) {
+        section = element('div', null, { class: 'card google-section' }); section.dataset.query = query;
+        section.append(element('strong', 'Google Search results', { class: 'google-heading' }), element('div', null, { class: 'grid' }),
+          element('div', null, { class: 'google-states' }), element('p', '0 provider pages found', { class: 'google-summary', role: 'status' }));
+        results.append(section);
+      }
+      section.searchController?.abort();
+      const parentSignal = signal, controller = new root.AbortController();
+      section.searchController = controller;
+      const cancel = () => controller.abort();
+      parentSignal.addEventListener('abort', cancel, { once: true });
+      controller.signal.addEventListener('abort', () => parentSignal.removeEventListener('abort', cancel), { once: true });
+      signal = controller.signal;
+      section.dataset.complete = 'false'; section.dataset.interrupted = 'false';
+      const grid = section.querySelector('.grid'), states = section.querySelector('.google-states'), summary = section.querySelector('.google-summary');
+      for (const card of grid.querySelectorAll('[data-enriched="false"]')) card.remove();
+      states.replaceChildren();
+      const context = { seen: new Set([...grid.querySelectorAll('.google-card')].map(card => card.dataset.source)), signal, summary };
       await Promise.all(googleQueries(query).map(async url => {
         const state = element('p', 'Searching Google…'); states.append(state);
         try {
-          const html = await this.cross(url, { signal });
+          const titles = await this.cached('google:' + this.target.type + ':' + url, signal, async () => {
+            const html = await this.cross(url, { signal });
+            const found = googleResults(parse(html), this.target.type);
+            if (!found.length) throw new Error('No readable provider results. Google may require JavaScript, consent, or a challenge.');
+            return found;
+          });
           if (signal.aborted) return;
-          const titles = googleResults(parse(html), this.target.type);
-          if (!titles.length) throw new Error('No readable provider results. Google may require JavaScript, consent, or a challenge.');
-          await this.renderGoogle(titles, grid, context); state.remove();
+          await this.renderGoogle(titles, grid, context);
+          if (signal.aborted) return;
+          state.remove();
         } catch (e) {
           if (signal.aborted) return;
           this.googleTab(url, grid, context, signal, state, e.message);
         }
       }));
+      if (!signal.aborted) section.dataset.complete = String(!states.childElementCount);
     }
     googleTab(url, grid, context, signal, state, initialError) {
       if (signal.aborted || this.busy) return;
@@ -776,6 +1058,7 @@
       let done = false;
       const finish = () => {
         done = true; root.clearTimeout(record.timer); root.clearTimeout(record.attentionTimer);
+        signal.removeEventListener('abort', finish);
         GM_removeValueChangeListener(record.listener); GM_deleteValue(key); closeTab();
       };
       const attention = message => {
@@ -799,31 +1082,55 @@
           if (!Array.isArray(value.titles)) throw new Error('Invalid Google response.');
           const titles = value.titles.slice(0, 30).map(item => {
             const source = manualSource(item.sources?.[0]?.url);
-            if (!['Amazon', 'Apple TV'].includes(source.provider)) throw new Error('Unsupported Google result.');
+            if (source.generic || !['Amazon', 'Apple TV'].includes(source.provider)) throw new Error('Unsupported Google result.');
             source.countries = ['Google'];
             return { title: String(item.title).slice(0, 300), sources: [source] };
           });
-          await this.renderGoogle(titles, grid, context); state.remove();
-        } catch (e) { if (!signal.aborted) state.textContent = e.message; }
+          if (titles.length) this.cache.set('google:' + this.target.type + ':' + url, titles, signal);
+          await this.renderGoogle(titles, grid, context);
+          if (signal.aborted) return;
+          state.remove();
+          const section = grid.closest('.google-section');
+          if (section && !signal.aborted) section.dataset.complete = String(!section.querySelector('.google-states').childElementCount);
+        } catch (e) {
+          if (!signal.aborted) { state.textContent = e.message; grid.closest('.google-section').dataset.interrupted = 'true'; }
+        }
       });
       state.textContent = `${query}: Searching in a background tab…`;
       record.attentionTimer = root.setTimeout(() => attention('No results received yet. Google may require consent or a challenge, or have no matching pages. ' + initialError), 20000);
-      record.timer = root.setTimeout(() => { state.textContent = `${query}: Search expired. Run the search again to retry.`; finish(); }, TTL);
+      record.timer = root.setTimeout(() => {
+        state.textContent = `${query}: Search expired. Run the search again to retry.`;
+        grid.closest('.google-section').dataset.interrupted = 'true'; finish();
+      }, TTL);
+      signal.addEventListener('abort', finish, { once: true });
       openTab(false);
     }
-    async config(signal) {
-      const html = await this.request(`${this.target.path}/images/${this.kind === 'backdrop' ? 'backdrops' : 'posters'}/upload`, { signal });
-      return uploadConfig(parse(html), this.kind, this.target);
+    async config(signal, kind = this.kind) {
+      const html = await this.request(`${this.target.path}/images/${kind === 'backdrop' ? 'backdrops' : 'posters'}/upload`, { signal });
+      return uploadConfig(parse(html), kind, this.target);
     }
-    async fetchTitle(title) {
+    async fetchTitle(title, kind = this.kind) {
       if (this.busy) return;
+      if (this.previewing) this.back();
+      this.kind = kind;
+      if (this.directKind) this.directKind.value = kind;
       const signal = this.newRequest();
+      if (!this.discovery) {
+        this.discovery = element('div'); this.panel.append(this.discovery);
+        this.discovery.append(this.status, this.results);
+      }
+      this.searchView = { results: this.results, status: this.status, scroll: this.panel.scrollTop, focus: this.shadow.activeElement };
+      this.discovery.hidden = true; this.previewing = true;
+      this.preview = element('div');
+      this.results = element('div', null, { class: 'grid' }); this.status = element('p', '', { class: 'status', role: 'status' });
+      this.preview.append(button('Back to results', () => this.back()), element('h3', kind === 'poster' ? 'Poster' : 'Background'), this.status, this.results);
+      this.panel.append(this.preview); this.panel.scrollTop = 0;
+      this.preview.querySelector('button').focus({ preventScroll: true });
       const { results, status } = this;
-      results.replaceChildren();
       status.textContent = 'Reading TMDB image limits…';
       let config;
       try {
-        config = await this.config(signal);
+        config = await this.config(signal, kind);
       } catch (e) {
         if (!signal.aborted) status.textContent = e.message;
         return;
@@ -837,18 +1144,20 @@
         const state = element('p', 'Loading…'); card.append(state);
         try {
           let assets;
-          if (source.provider === 'Kanopy') {
-            assets = await fetchKanopy(source.url, this.kind, this.cross, signal);
+          if (source.generic) {
+            assets = await this.genericAssets(source, config, signal);
           } else {
-            const html = await this.cross(source.url, { signal });
-            assets = extract(parse(html), source.url, this.kind);
+            const record = await this.providerRecord(source, signal);
+            assets = record.artwork[kind];
+            if (!assets) throw new Error(record.errors[kind] || 'No artwork available.');
           }
           await this.addAssets(assets, source, card, config, signal);
           state.remove();
         } catch (e) {
           if (signal.aborted) return;
           state.textContent = e.message; state.className = 'error';
-          card.append(button('Open source tab', event => this.sourceTab(source, card, config, signal, event.currentTarget)));
+          if (source.generic) card.append(link('Open source page', source.url), element('p', 'Try pasting a direct image URL. Pages that require JavaScript are not rendered automatically.'));
+          else card.append(button('Open source tab', event => this.sourceTab(source, card, config, signal, event.currentTarget)));
         }
       }
     }
@@ -863,17 +1172,17 @@
         img.addEventListener('click', () => img.classList.toggle('full'));
         block.append(element('p', asset.title || this.target.title), img,
           element('p', `Source ${prepared.sourceWidth}×${prepared.sourceHeight} → JPEG ${prepared.crop.width}×${prepared.crop.height} · ${(prepared.blob.size / 1024).toFixed(0)} KB. Center crop; click image to enlarge.`));
-        if (this.kind === 'poster' && prepared.sourceWidth >= prepared.sourceHeight) {
+        if (config.kind === 'poster' && prepared.sourceWidth >= prepared.sourceHeight) {
           block.append(element('p', 'This provider artwork is landscape. The poster crop removes the sides; check that titles and faces remain intact.', { class: 'error' }));
         }
-        const language = element('input', null, { value: this.kind === 'backdrop' ? 'xx-XX' : 'en-US', list: 'artwork-languages', 'aria-label': 'Image language' });
+        const language = element('input', null, { value: config.kind === 'backdrop' ? 'xx-XX' : 'en-US', list: 'artwork-languages', 'aria-label': 'Image language' });
         const label = element('label', 'Image language '); label.append(language); block.append(label);
         if (!this.panel.querySelector('#artwork-languages')) {
           const list = element('datalist', null, { id: 'artwork-languages' });
           for (const [value, text] of [['xx-XX', 'No language'], ['en-US', 'English'], ['en-GB', 'English (UK)'], ['pl-PL', 'Polish'], ['de-DE', 'German'], ['fr-FR', 'French'], ['es-ES', 'Spanish'], ['it-IT', 'Italian'], ['ja-JP', 'Japanese']]) list.append(element('option', text, { value }));
           this.panel.append(list);
         }
-        const name = filename(this.target, this.kind);
+        const name = filename(this.target, config.kind);
         const row = element('div', null, { class: 'row' });
         const save = link('Save JPEG', url); save.setAttribute('download', name);
         const upload = button('Upload this image', () => this.upload(prepared, name, language.value, config, block, upload));
@@ -899,12 +1208,12 @@
       const response = await this.request(`/image/${id}/language`, { body });
       if (response.success !== true) throw new Error(response.message || 'Language update failed.');
     }
-    languageRetry(id, value, mediaId, state) {
+    languageRetry(id, value, mediaId, state, kind) {
       const retry = button('Retry language only', async () => {
         if (this.busy) return;
         this.lock(true);
         try {
-          const config = await this.config();
+          const config = await this.config(undefined, kind);
           if (config.mediaId !== mediaId) throw new Error('TMDB returned a different title. Reload the correct gallery.');
           await this.language(id, value, config);
           state.textContent = 'Uploaded; language updated.';
@@ -929,7 +1238,7 @@
       let attempted = false;
       try {
         state.textContent = 'Checking the upload session…';
-        const config = await this.config();
+        const config = await this.config(undefined, originalConfig.kind);
         const { width, height } = prepared.crop;
         const sameForm = config.mediaId === originalConfig.mediaId &&
           config.ratioWidth === originalConfig.ratioWidth && config.ratioHeight === originalConfig.ratioHeight;
@@ -952,7 +1261,7 @@
         try { await this.language(result.id, language, config); }
         catch (e) {
           state.textContent += ` Language was not updated: ${e.message}`;
-          block.append(this.languageRetry(result.id, language, config.mediaId, state));
+          block.append(this.languageRetry(result.id, language, config.mediaId, state, config.kind));
         }
       } catch (e) {
         state.textContent = attempted ? `${e.message} The image may already have reached TMDB. Check the gallery before starting another upload.` : e.message;
@@ -968,7 +1277,7 @@
       if (signal.aborted) return;
       opener.disabled = true;
       const id = root.crypto.randomUUID(); const key = PREFIX + id;
-      const job = { id, url: source.url, kind: this.kind, expires: Date.now() + TTL, state: 'waiting' };
+      const job = { id, url: source.url, kind: config.kind, expires: Date.now() + TTL, state: 'waiting' };
       GM_setValue(key, job);
       const listener = GM_addValueChangeListener(key, async (_key, _old, value) => {
         if (signal.aborted || !value || value.state !== 'ready' || value.expires < Date.now()) return;
@@ -979,10 +1288,10 @@
         } catch (e) { if (!signal.aborted) card.append(element('p', e.message, { class: 'error' })); }
       });
       const url = new URL(source.url); url.hash = 'tmdb-artwork=' + id;
-      GM_openInTab(url.href, { active: true, insert: true, setParent: true });
+      const tab = GM_openInTab(url.href, { active: true, insert: true, setParent: true });
       card.append(element('p', 'In the source tab, resolve any challenge and click “Send artwork to TMDB”. This request expires in 10 minutes.'));
       const timer = root.setTimeout(() => { if (!signal.aborted) { GM_removeValueChangeListener(listener); GM_deleteValue(key); opener.disabled = false; } }, TTL);
-      this.jobs.push({ id, listener, timer });
+      this.jobs.push({ id, listener, timer, tab });
     }
   }
   function googleHelper(job, key) {
@@ -1052,7 +1361,7 @@
     const target = targetFromPage(root.document, root.location.href);
     if (target && !root.document.getElementById('tmdb-artwork')) new App(target);
   }
-  const api = { QUERY, regions, targetFromPage, exactMatch, provider, canonicalProvider, searchResults, amazonVariants,
+  const api = { QUERY, Cache, pageImages, webURL, regions, targetFromPage, exactMatch, provider, canonicalProvider, searchResults, amazonVariants,
     amazonArtwork, appleArtwork, kanopyAPI, kanopyArtwork, fetchKanopy, manualSource, discoveryLinks, googleQueries, googleResults, cleanGoogleTitle, providerMetadata, crossRequest, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else start();

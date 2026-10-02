@@ -77,6 +77,8 @@
   const PREFIX = 'tmdb-artwork-job:';
   const CACHE_PREFIX = 'tmdb-artwork-cache:v1:';
   const CACHE_TTL = 15 * 60 * 1000;
+  const CACHE_MAX_BYTES = 5 * 1024 * 1024;
+  const BLOB_MAX_BYTES = 50 * 1024 * 1024;
   class Cache {
     constructor() { this.blobs = new Map(); }
     records() {
@@ -101,11 +103,11 @@
       try {
         const entry = { version: 1, created: Date.now(), expires: Date.now() + CACHE_TTL, value };
         const size = JSON.stringify(entry).length * 2;
-        if (size > 5 * 1024 * 1024) return;
+        if (size > CACHE_MAX_BYTES) return;
         const storageKey = CACHE_PREFIX + key;
         const records = this.records().filter(r => r.key !== storageKey).sort((a, b) => a.entry.created - b.entry.created);
         let total = records.reduce((sum, r) => sum + r.size, size);
-        while (records.length >= 200 || total > 5 * 1024 * 1024) {
+        while (records.length >= 200 || total > CACHE_MAX_BYTES) {
           const oldest = records.shift(); total -= oldest.size; GM_deleteValue(oldest.key);
         }
         GM_setValue(storageKey, entry);
@@ -116,10 +118,10 @@
       return this.blobs.get(url)?.blob;
     }
     setBlob(url, blob, signal) {
-      if (signal?.aborted || blob.size > 50 * 1024 * 1024) return;
+      if (signal?.aborted || blob.size > BLOB_MAX_BYTES) return;
       this.getBlob(url); this.blobs.delete(url);
       let total = [...this.blobs.values()].reduce((sum, e) => sum + e.blob.size, blob.size);
-      while (total > 50 * 1024 * 1024) {
+      while (total > BLOB_MAX_BYTES) {
         const key = this.blobs.keys().next().value;
         total -= this.blobs.get(key).blob.size; this.blobs.delete(key);
       }
@@ -132,6 +134,13 @@
     }
   }
   function checkCancelled(signal) { if (signal?.aborted) throw new Error('Cancelled.'); }
+  async function forEachConcurrent(items, signal, visit) {
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(3, items.length) }, async () => {
+      while (next < items.length && !signal.aborted) await visit(items[next++]);
+    }));
+  }
+  function uniqueArtwork(assets) { return [...new Map(assets.map(asset => [asset.url, asset])).values()]; }
   function webURL(value, base) {
     try {
       const url = new URL(value, base);
@@ -280,7 +289,8 @@
   }
   function providerMetadata(doc, pageURL) {
     const year = value => String(value || '').match(/\b(?:18|19|20|21)\d{2}\b/)?.[0] || '';
-    if (provider(pageURL) === 'Amazon') {
+    const name = provider(pageURL);
+    if (name === 'Amazon') {
       const headers = amazonHeaders(doc);
       const entry = headers[titlePageId(pageURL)] || (Object.keys(headers).length === 1 ? Object.values(headers)[0] : null);
       if (entry?.title) {
@@ -290,7 +300,7 @@
           type: entry.titleType === 'movie' ? 'Movie' : entry.titleType ? 'TV series' : '',
         };
       }
-    } else if (provider(pageURL) === 'Apple TV') {
+    } else if (name === 'Apple TV') {
       const item = appleTitleItems(doc, pageURL).find(item => item.title);
       if (item) {
         return {
@@ -299,7 +309,7 @@
           type: item.type === 'Movie' || item.primaryMetadata?.includes('Movie') ? 'Movie' : 'TV series',
         };
       }
-    } else if (provider(pageURL) === 'Disney+') {
+    } else if (name === 'Disney+') {
       const page = disneyTitleData(doc, pageURL);
       if (page?.details?.title) return { title: page.details.title, year: year(page.hero?.releaseYear || page.details.release),
         type: page.schema?.['@type'] === 'Movie' ? 'Movie' : page.schema?.['@type'] === 'TVSeries' || page.hero?.seasonsAvailable ? 'TV series' : '' };
@@ -441,7 +451,7 @@
     if (typeof session.jwt !== 'string' || !session.jwt || !Number.isInteger(session.webshopId) || session.webshopId <= 0) {
       throw new Error('Kanopy visitor initialization failed. Open the source tab and try again.');
     }
-    if (signal?.aborted) throw new Error('Cancelled.');
+    checkCancelled(signal);
     const data = JSON.parse(await request(kanopyAPI(pageURL, session.webshopId), {
       signal, anonymous: true, headers: { ...headers, Authorization: 'Bearer ' + session.jwt },
     }));
@@ -465,14 +475,13 @@
         assets.push({ title: video.title, url: original, variants: [original] });
       }
     }
-    const unique = [...new Map(assets.map(a => [a.url, a])).values()];
+    const unique = uniqueArtwork(assets);
     if (!unique.length) throw new Error(`Kanopy has no ${kind === 'backdrop' ? 'background' : 'poster'} artwork for this title.`);
     return unique;
   }
   function extract(doc, url, kind) {
-    const result = provider(url) === 'Disney+' ? disneyArtwork(doc, kind, url) :
-      provider(url) === 'Apple TV' ? appleArtwork(doc, kind, url) : amazonArtwork(doc, kind);
-    const unique = [...new Map(result.map(a => [a.url, a])).values()];
+    const extractor = { 'Disney+': disneyArtwork, 'Apple TV': appleArtwork }[provider(url)] || amazonArtwork;
+    const unique = uniqueArtwork(extractor(doc, kind, url));
     if (!unique.length) throw new Error('No title artwork found. The page may require a challenge or sign-in.');
     return unique;
   }
@@ -784,10 +793,16 @@
       const blob = await this.cross(url, { blob: true, signal });
       checkCancelled(signal);
       // Decode before caching so error pages and unsupported files are retried.
-      const image = await this.decode(blob);
-      const dimensions = { width: image.width, height: image.height }; image.close(); checkCancelled(signal);
-      this.cache.set('dimensions:' + url, dimensions, signal);
+      await this.imageDimensions(url, blob, signal);
+      checkCancelled(signal);
       this.cache.setBlob(url, blob, signal); return blob;
+    }
+    async imageDimensions(url, blob, signal) {
+      const image = await this.decode(blob);
+      const dimensions = { width: image.width, height: image.height };
+      image.close(); checkCancelled(signal);
+      this.cache.set('dimensions:' + url, dimensions, signal);
+      return dimensions;
     }
     async providerRecord(source, signal) {
       return this.cached('provider:' + source.url, signal, async () => {
@@ -807,52 +822,48 @@
         return record;
       });
     }
+    async genericPage(source, signal) {
+      const response = await this.cross(source.url, { blob: true, detailed: true, signal });
+      checkCancelled(signal);
+      const { body, contentType, finalURL } = response;
+      if (!webURL(finalURL)) throw new Error('Source redirected to an unsupported URL.');
+      const type = contentType || body.type || '';
+      if (!/html|xhtml/i.test(type)) {
+        try {
+          const decoded = await this.decode(body); decoded.close(); checkCancelled(signal);
+          return { image: true, blob: body };
+        } catch (e) { checkCancelled(signal); if (/^image\//i.test(type)) throw e; }
+      }
+      const doc = parse(await blobText(body));
+      checkCancelled(signal);
+      if (/just a moment|access denied|verify you are human|captcha/i.test(doc.title)) throw new Error('This page requires a browser challenge. Paste a direct image URL instead.');
+      return { candidates: pageImages(doc, finalURL) };
+    }
     async genericAssets(source, config, signal) {
       const key = 'page:' + source.url;
       const cachedPage = this.cache.get(key);
-      let page = cachedPage;
-      if (!page) {
-        const response = await this.cross(source.url, { blob: true, detailed: true, signal });
-        checkCancelled(signal);
-        const { body, contentType, finalURL } = response;
-        if (!webURL(finalURL)) throw new Error('Source redirected to an unsupported URL.');
-        const type = contentType || body.type || '';
-        if (!/html|xhtml/i.test(type)) {
-          try {
-            const decoded = await this.decode(body); decoded.close(); checkCancelled(signal);
-            this.cache.setBlob(source.url, body, signal);
-            this.cache.set(key, { image: true }, signal);
-            return [{ url: source.url, variants: [source.url], generic: true, blob: body }];
-          } catch (e) { checkCancelled(signal); if (/^image\//i.test(type)) throw e; }
+      const page = cachedPage || await this.genericPage(source, signal);
+      checkCancelled(signal);
+      if (page.image) {
+        if (!cachedPage) {
+          this.cache.setBlob(source.url, page.blob, signal);
+          this.cache.set(key, { image: true }, signal);
         }
-        const doc = parse(await blobText(body));
-        checkCancelled(signal);
-        if (/just a moment|access denied|verify you are human|captcha/i.test(doc.title)) throw new Error('This page requires a browser challenge. Paste a direct image URL instead.');
-        page = { candidates: pageImages(doc, finalURL) };
+        return [{ url: source.url, variants: [source.url], generic: true, ...(page.blob ? { blob: page.blob } : {}) }];
       }
-      if (page.image) return [{ url: source.url, variants: [source.url], generic: true }];
-      const candidates = [...page.candidates]; let best;
-      await Promise.all(Array.from({ length: Math.min(3, candidates.length) }, async () => {
-        while (candidates.length && !signal.aborted) {
-          const url = candidates.shift();
-          try {
-            const blob = await this.download(url, signal);
-            let dimensions = this.cache.get('dimensions:' + url);
-            if (!dimensions) {
-              const decoded = await this.decode(blob);
-              dimensions = { width: decoded.width, height: decoded.height }; decoded.close();
-              this.cache.set('dimensions:' + url, dimensions, signal);
-            }
-            checkCancelled(signal);
-            const { width, height } = dimensions;
-            if (!(config.kind === 'poster' ? height > width : width > height) || !cropPlan(width, height, config).valid) continue;
-            const area = width * height, difference = Math.abs(width / height - config.ratioWidth / config.ratioHeight);
-            if (!best || area > best.area || (area === best.area && (difference < best.difference || (difference === best.difference && url < best.url)))) {
-              best = { url, area, difference, blob };
-            }
-          } catch (_) { /* One failed candidate must not hide other images. */ }
-        }
-      }));
+      let best;
+      await forEachConcurrent(page.candidates, signal, async url => {
+        try {
+          const blob = await this.download(url, signal);
+          const { width, height } = this.cache.get('dimensions:' + url) || await this.imageDimensions(url, blob, signal);
+          checkCancelled(signal);
+          if (!(config.kind === 'poster' ? height > width : width > height) || !cropPlan(width, height, config).valid) return;
+          const area = width * height, difference = Math.abs(width / height - config.ratioWidth / config.ratioHeight);
+          if (!best || area > best.area || (area === best.area && (difference < best.difference || (difference === best.difference && url < best.url)))) {
+            best = { url, area, difference, blob };
+          }
+        } catch (_) { /* One failed candidate must not hide other images. */ }
+      });
       checkCancelled(signal);
       if (!best) throw new Error('No suitable image found for this orientation and TMDB size limits. Paste a direct image URL instead.');
       if (!cachedPage) this.cache.set(key, page, signal);
@@ -1057,9 +1068,7 @@
       }
       summary.textContent = `${seen.size} provider ${seen.size === 1 ? 'page' : 'pages'} found`;
       // Bound metadata traffic; a blocked provider never discards another card.
-      await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
-        while (pending.length && !signal.aborted) await pending.shift()();
-      }));
+      await forEachConcurrent(pending, signal, read => read());
     }
     async googleSearch(query, signal, results) {
       if (signal.aborted) return;

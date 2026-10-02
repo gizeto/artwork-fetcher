@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMDB Artwork Fetcher
 // @namespace    https://github.com/gizeto/artwork-fetcher
-// @version      1.5.0
+// @version      1.6.0
 // @author       gizeto
 // @homepageURL  https://github.com/gizeto/artwork-fetcher
 // @supportURL   https://github.com/gizeto/artwork-fetcher/issues
@@ -26,6 +26,8 @@
 // @match        https://www.primevideo.com/*
 // @match        https://tv.apple.com/*
 // @match        https://www.kanopy.com/*
+// @match        https://www.disneyplus.com/*
+// @match        https://disneyplus.com/*
 // @match        https://www.google.com/search*
 // @connect      www.google.com
 // @connect      apis.justwatch.com
@@ -49,6 +51,8 @@
 // @connect      mzstatic.com
 // @connect      kanopy.com
 // @connect      static-assets.kanopy.com
+// @connect      disneyplus.com
+// @connect      disney.images.edge.bamgrid.com
 // @connect      *
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -173,6 +177,7 @@
       if (u.protocol !== 'https:') return null;
       if (u.hostname === 'tv.apple.com') return 'Apple TV';
       if (u.hostname === 'www.kanopy.com') return 'Kanopy';
+      if (['www.disneyplus.com', 'disneyplus.com'].includes(u.hostname)) return 'Disney+';
       if (AMAZON.has(u.hostname.replace(/^(?:www|watch)\./, ''))) return 'Amazon';
     } catch (_) { /* Not a provider link. */ }
     return null;
@@ -195,6 +200,7 @@
       case 'Kanopy': return /^(?:\/[a-z]{2})?\/product\/[a-z\d-]+\/?$/i.test(pathname);
       case 'Apple TV': return /\/(movie|show)\/[^/]+\/umc\./.test(pathname);
       case 'Amazon': return /\/(?:detail|dp|product)\/[^/]+/.test(pathname);
+      case 'Disney+': return /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/(?:browse\/entity-[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}|(?:movies|series)\/[^/]+\/[a-z\d-]+)\/?$/i.test(pathname);
       default: return false;
     }
   }
@@ -213,11 +219,12 @@
     return [['Search Google for streaming options', 'https://www.google.com/search?q=' + encodeURIComponent(query)]];
   }
   function googleQueries(title) {
-    return ['prime video', 'apple tv'].map(provider =>
+    return ['prime video', 'apple tv', 'disney plus'].map(provider =>
       'https://www.google.com/search?q=' + encodeURIComponent(`${title} ${provider}`));
   }
   function sourceIdentity(source) {
     const u = new URL(source.url);
+    if (source.provider === 'Disney+') return 'Disney+:' + titlePageId(source.url);
     return source.provider + ':' + (u.pathname.match(/\/(umc\.[^/]+|[A-Z0-9]{10}|[A-Z0-9]{26})(?:\/|$)/)?.[1] || source.url);
   }
   function googleResults(doc, type) {
@@ -228,7 +235,7 @@
         if (url.origin === 'https://www.google.com' && url.pathname === '/url') {
           url = new URL(url.searchParams.get('q') || url.searchParams.get('url'));
         }
-        if (!['Amazon', 'Apple TV'].includes(provider(url.href))) continue;
+        if (!['Amazon', 'Apple TV', 'Disney+'].includes(provider(url.href))) continue;
         const source = manualSource(url.href);
         if (source.generic) continue;
         const heading = anchor.querySelector('h3, [role="heading"]');
@@ -237,6 +244,8 @@
         const title = cleanGoogleTitle(titleNode.textContent);
         if (!title || /^https?:\/\//.test(title)) continue;
         if (source.provider === 'Apple TV' && !url.pathname.includes(type === 'tv' ? '/show/' : '/movie/')) continue;
+        if (source.provider === 'Disney+' && /\/(movies|series)\//.test(url.pathname) &&
+          !url.pathname.includes(type === 'tv' ? '/series/' : '/movies/')) continue;
         source.countries = ['Google', ...(source.provider === 'Apple TV' ? [url.pathname.split('/')[1].toUpperCase()] : [])];
         const key = sourceIdentity(source);
         if (!found.has(key)) found.set(key, { title, sources: [source] });
@@ -246,7 +255,8 @@
   }
   function cleanGoogleTitle(value) {
     return String(value || '').replace(/\s+/g, ' ').trim()
-      .replace(/\s*(?:[-|–—:]\s*)?(?:Amazon(?:\.com)?(?:\s+Prime)?\s+Video|Prime\s*Video|Apple\s*TV)(?:\s*[-|–—:]?\s*\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)?\s*$/i, '')
+      .replace(/\s*(?:[-|–—:]\s*)?(?:Amazon(?:\.com)?(?:\s+Prime)?\s+Video|Prime\s*Video|Apple\s*TV|Disney\s*\+)(?:\s*[-|–—:]?\s*\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)?\s*$/i, '')
+      .replace(/\s*\|\s*Watch (?:Full Episodes|Full Movie|Now)\s*$/i, '')
       .replace(/^Watch\s+/i, '').trim().slice(0, 300);
   }
   function titlePageId(url) {
@@ -289,6 +299,10 @@
           type: item.type === 'Movie' || item.primaryMetadata?.includes('Movie') ? 'Movie' : 'TV series',
         };
       }
+    } else if (provider(pageURL) === 'Disney+') {
+      const page = disneyTitleData(doc, pageURL);
+      if (page?.details?.title) return { title: page.details.title, year: year(page.hero?.releaseYear || page.details.release),
+        type: page.schema?.['@type'] === 'Movie' ? 'Movie' : page.schema?.['@type'] === 'TVSeries' || page.hero?.seasonsAvailable ? 'TV series' : '' };
     }
     // Only title-level structured data, never a search snippet's crawl date or recommendations.
     for (const node of doc.querySelectorAll('script[type="application/ld+json"]')) {
@@ -338,7 +352,8 @@
       const u = new URL(url);
       return u.protocol === 'https:' && (u.hostname === 'm.media-amazon.com' ||
         u.hostname === 'images-na.ssl-images-amazon.com' || u.hostname.endsWith('.mzstatic.com') ||
-        (u.hostname === 'static-assets.kanopy.com' && u.pathname.startsWith('/video-images/')));
+        (u.hostname === 'static-assets.kanopy.com' && u.pathname.startsWith('/video-images/')) ||
+        (u.hostname === 'disney.images.edge.bamgrid.com' && /^\/ripcut-delivery\/v2\/variant\/disney\/[a-z\d-]+\/(?:compose|scale)$/i.test(u.pathname)));
     } catch (_) { return false; }
   }
   function amazonVariants(url) {
@@ -371,6 +386,43 @@
       if (isImageURL(url)) assets.push({ title: item.title, url, variants: [url] });
     }
     return assets;
+  }
+  function disneyTitleData(doc, pageURL) {
+    const node = doc.querySelector('#__NEXT_DATA__');
+    if (!node) return null;
+    const data = JSON.parse(node.textContent), props = data.props?.pageProps;
+    const id = titlePageId(pageURL);
+    if (!props || (props.pageId || data.query?.slug) !== id) return null;
+    // Only the top-level title sections; episodes, recommendations and offers have other images.
+    const content = props.stitchDocument?.mainContent || [];
+    const metadata = content.find(item => item._type === 'Metadata');
+    return { hero: content.find(item => item._type === 'DetailEntityHero'),
+      details: content.find(item => item._type === 'MediaDetails'), metadata,
+      schema: metadata?.ldJSON?.['@graph']?.find(item => ['Movie', 'TVSeries'].includes(item['@type'])) };
+  }
+  function disneyOriginal(url) {
+    if (!isImageURL(url) || new URL(url).hostname !== 'disney.images.edge.bamgrid.com') return null;
+    const original = new URL(url);
+    // Removing social-image crops restores the native portrait; removing size limits restores native pixels.
+    for (const key of ['width', 'height', 'aspectRatio', 'max']) original.searchParams.delete(key);
+    return original.href;
+  }
+  function disneyArtwork(doc, kind, pageURL) {
+    const page = disneyTitleData(doc, pageURL);
+    if (!page) return [];
+    const title = page.details?.title || page.hero?.backgroundImage?.alt;
+    let source;
+    if (kind === 'backdrop') {
+      const images = Object.values(page.hero?.backgroundImage || {}).filter(image => image?.source);
+      source = images.sort((a, b) => (b.width || 0) - (a.width || 0))[0]?.source;
+    }
+    const property = kind === 'poster' ? 'twitter:image' : 'og:image';
+    source ||= page.metadata?.metaTags?.find(tag => tag.property === property || tag.name === property)?.content;
+    const original = disneyOriginal(source);
+    if (!original) return [];
+    // Social thumbnails can be landscape crops of a portrait. Never use that crop as a poster fallback.
+    const variants = kind === 'poster' ? [original] : [...new Set([original, source])];
+    return [{ title, url: original, variants, orientation: kind === 'poster' ? 'portrait' : 'landscape' }];
   }
   function kanopyAPI(pageURL, webshopId = 9) {
     const source = manualSource(pageURL);
@@ -418,7 +470,8 @@
     return unique;
   }
   function extract(doc, url, kind) {
-    const result = provider(url) === 'Apple TV' ? appleArtwork(doc, kind, url) : amazonArtwork(doc, kind);
+    const result = provider(url) === 'Disney+' ? disneyArtwork(doc, kind, url) :
+      provider(url) === 'Apple TV' ? appleArtwork(doc, kind, url) : amazonArtwork(doc, kind);
     const unique = [...new Map(result.map(a => [a.url, a])).values()];
     if (!unique.length) throw new Error('No title artwork found. The page may require a challenge or sign-in.');
     return unique;
@@ -608,6 +661,10 @@
       if (!(asset.generic ? webURL(url) : isImageURL(url))) continue;
       try {
         const decoded = await decode(asset.blob && url === asset.url ? asset.blob : await download(url, signal));
+        if ((asset.orientation === 'portrait' && decoded.width >= decoded.height) ||
+          (asset.orientation === 'landscape' && decoded.width <= decoded.height)) {
+          decoded.close(); throw new Error('The source does not provide artwork in the requested orientation.');
+        }
         if (!best || decoded.width * decoded.height >= best.width * best.height) {
           best?.close();
           best = decoded;
@@ -736,7 +793,8 @@
       return this.cached('provider:' + source.url, signal, async () => {
         const record = { artwork: {}, errors: {} };
         const data = source.provider === 'Kanopy' ? await kanopyData(source.url, this.cross, signal) :
-          parse(await this.cross(source.url, { signal }));
+          // Disney's public page supplies title artwork; an authenticated response can be only an app shell.
+          parse(await this.cross(source.url, { signal, ...(source.provider === 'Disney+' ? { anonymous: true } : {}) }));
         checkCancelled(signal);
         for (const kind of ['backdrop', 'poster']) {
           try { record.artwork[kind] = source.provider === 'Kanopy' ? kanopyArtwork(data, kind, source.url) : extract(data, source.url, kind); }
@@ -1082,7 +1140,7 @@
           if (!Array.isArray(value.titles)) throw new Error('Invalid Google response.');
           const titles = value.titles.slice(0, 30).map(item => {
             const source = manualSource(item.sources?.[0]?.url);
-            if (source.generic || !['Amazon', 'Apple TV'].includes(source.provider)) throw new Error('Unsupported Google result.');
+            if (source.generic || !['Amazon', 'Apple TV', 'Disney+'].includes(source.provider)) throw new Error('Unsupported Google result.');
             source.countries = ['Google'];
             return { title: String(item.title).slice(0, 300), sources: [source] };
           });
@@ -1362,7 +1420,7 @@
     if (target && !root.document.getElementById('tmdb-artwork')) new App(target);
   }
   const api = { QUERY, Cache, pageImages, webURL, regions, targetFromPage, exactMatch, provider, canonicalProvider, searchResults, amazonVariants,
-    amazonArtwork, appleArtwork, kanopyAPI, kanopyArtwork, fetchKanopy, manualSource, discoveryLinks, googleQueries, googleResults, cleanGoogleTitle, providerMetadata, crossRequest, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
+    amazonArtwork, appleArtwork, disneyArtwork, kanopyAPI, kanopyArtwork, fetchKanopy, manualSource, discoveryLinks, googleQueries, googleResults, cleanGoogleTitle, providerMetadata, crossRequest, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else start();
 })(globalThis);

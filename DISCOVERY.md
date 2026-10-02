@@ -10,8 +10,8 @@ still exposed hero artwork. Its [Apple page](https://tv.apple.com/us/movie/examp
 provided a 1920×1080 background and a 400×574 poster (too small for TMDB).
 The captured JustWatch offers-history response contained no former provider URLs.
 
-The script searches JustWatch first, then Google for `<title> prime video` and
-`<title> apple tv` when an exact match lacks supported links. Google results are
+The script searches JustWatch first, then Google for `<title> prime video`,
+`<title> apple tv`, and `<title> disney plus` when an exact match lacks supported links. Google results are
 deduplicated candidates requiring selection. Pasted provider URLs also work and
 are remembered per TMDB title.
 
@@ -38,6 +38,18 @@ background-tab integration is tested with mocks, not yet in live Chrome.
   `/kapi/videos/alias/<alias>`. This fixed the metadata 401 in a live HTTP check.
   Unwrap the image proxy to fetch originals; Example Journey supplied 1920×1080
   landscape and 1548×2189 portrait images. Tokens stay in memory and go only to Kanopy.
+- **Disney+ (checked October 2, 2026):** the public
+  [Example Series entity page](https://www.disneyplus.com/browse/entity-00000000-0000-4000-8000-000000000201)
+  supplies title data in `__NEXT_DATA__.props.pageProps.stitchDocument.mainContent`.
+  Match `pageId` to the requested entity before reading `DetailEntityHero`,
+  `MediaDetails`, and `Metadata`; skip episodes, recommendations, offers, and title logos.
+  Removing `width`, `height`, `aspectRatio`, and `max` from its Ripcut image URLs
+  returned a native 3840×2160 hero and a 2000×2818 portrait from `twitter:image`,
+  whose webpage URL otherwise crops it to landscape. Decoded orientation is checked;
+  a title whose native social image is landscape-only cannot supply a poster this way.
+  Legacy `/movies/…` and `/series/…` links are recognized; redirects to a different
+  entity ID may need **Open source tab**. Authenticated app pages with no matching
+  public title data may require pasting the public entity link or a direct image URL.
 
 These website interfaces are undocumented and may change. Discovery is best effort;
 always verify the selected title and final JPEG before uploading.

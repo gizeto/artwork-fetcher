@@ -1,6 +1,6 @@
 # artwork-fetcher
 
-Find Amazon/Prime Video, Apple TV, and Kanopy backgrounds and posters from TMDB,
+Find Amazon/Prime Video, Apple TV, Kanopy, and Disney+ backgrounds and posters from TMDB,
 or use an image or webpage URL from another site.
 Preview a high-quality JPEG, then upload only when you confirm. No API key or backend.
 Currently supports movies and whole TV series, including image galleries; TVDB is not supported yet.
@@ -8,7 +8,7 @@ Currently supports movies and whole TV series, including image galleries; TVDB i
 ## Install and update
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) and [enable userscripts](https://www.tampermonkey.net/faq.php#Q209).
-2. **[Install artwork-fetcher](https://raw.githubusercontent.com/gizeto/artwork-fetcher/main/artwork-fetcher.user.js)** and allow its host permissions. Version 1.5 adds wildcard connection permission for pasted webpages and their image CDNs; Tampermonkey may ask you to allow a new host. The script still runs only on TMDB and the existing provider/Google helper pages.
+2. **[Install artwork-fetcher](https://raw.githubusercontent.com/gizeto/artwork-fetcher/main/artwork-fetcher.user.js)** and allow its host permissions. Version 1.6 adds Disney+ title artwork, discovery, and helper pages. Version 1.5 added wildcard connection permission for pasted webpages and their image CDNs; Tampermonkey may ask you to allow a new host. The script runs only on TMDB and the provider/Google helper pages.
 3. Log into TMDB and reload a movie or TV series page.
 
 Tampermonkey checks the same raw URL for updates. These links become available
@@ -32,6 +32,10 @@ this renamed version to avoid duplicate scripts.
   results are candidates and may have no reliable year.
 - **Search Google** also runs those provider searches manually, appending cards
   alongside JustWatch results, even when JustWatch has an exact match.
+- **Disney+** title links work in JustWatch results, Google searches, and pasted URLs,
+  including `/browse/entity-…` links. Native backgrounds and portraits are fetched
+  without the webpage's resizing and social-image crops. If the native social image
+  is landscape-only, poster fetching reports an error so you can choose another source.
 - Below results, **Find or paste an image or webpage URL** accepts and remembers
   HTTP(S) URLs. Select Background or Poster, then **Fetch from URL**. Recognized
   provider title pages use their dedicated handlers. Direct image links, including
@@ -75,7 +79,7 @@ npm test
 node --check artwork-fetcher.user.js
 ```
 
-Tests cover parsing, matching, real JPEG output, manual/automatic Google searches,
+Tests cover provider parsing (including Disney+), matching, real JPEG output, manual/automatic Google searches,
 Back navigation, cache expiry and limits, arbitrary URL image selection,
 cancellation, and mocked uploads. Fixtures contain public metadata and synthetic
 tokens; keep HARs and secrets out of Git. Live HTTP checks verified provider

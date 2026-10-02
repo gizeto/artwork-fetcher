@@ -131,6 +131,58 @@ test('Kanopy unwraps native images and selects only the requested title and artw
   assert.equal(titles[0].sources[0].provider, 'Kanopy');
 });
 
+const disneyURL = 'https://www.disneyplus.com/browse/entity-00000000-0000-4000-8000-000000000201';
+
+test('Disney+ recognizes entity and legacy title links in pasted URLs, JustWatch and Google', t => {
+  const { api, doc } = environment(t);
+  const direct = api.manualSource(disneyURL + '?utm_source=justwatch#tracking');
+  assert.equal(direct.provider, 'Disney+'); assert.equal(direct.generic, undefined); assert.equal(direct.url, disneyURL);
+  assert.equal(api.provider(disneyURL.replace('www.disneyplus.com', 'disneyplus.com')), 'Disney+');
+  assert.equal(api.provider(disneyURL.replace('www.disneyplus.com', 'disneyplus.com.evil.test')), null);
+  for (const path of ['/browse', '/browse/entity-invalid', '/login', '/browse/entity-00000000-0000-4000-8000-000000000201/extra']) {
+    assert.equal(api.manualSource('https://www.disneyplus.com' + path).generic, true);
+  }
+  const movie = 'https://www.disneyplus.com/movies/a-movie/ABC123';
+  const show = 'https://www.disneyplus.com/en-gb/series/a-show/XYZ789';
+  assert.equal(api.manualSource(movie).provider, 'Disney+'); assert.equal(api.manualSource(show).generic, undefined);
+  const node = { id: 'disney1', objectType: 'SHOW', content: { title: 'Example Series', originalReleaseYear: 2026 },
+    offers: [{ presentationType: 'HD', standardWebURL: disneyURL + '?utm_source=justwatch' }] };
+  const results = api.searchResults([{ country: 'US', data: { data: { searchTitles: { edges: [{ node }] } } } }], { type: 'tv' });
+  assert.equal(results[0].sources[0].url, disneyURL); assert.equal(results[0].sources[0].provider, 'Disney+');
+  const google = doc(`<a href="${disneyURL}"><h3>Example Series | Watch Full Episodes | Disney+</h3></a>
+    <a href="${disneyURL.replace('/browse/', '/en-gb/browse/')}"><h3>Duplicate</h3></a>
+    <a href="${movie}"><h3>A Movie | Disney+</h3></a><a href="${show}"><h3>A Show | Disney+</h3></a>`);
+  const titles = api.googleResults(google, 'tv');
+  assert.equal(titles.length, 2); assert.equal(titles[0].title, 'Example Series');
+  assert.equal(api.googleResults(google, 'movie').length, 2);
+  assert.equal(new URL(api.googleQueries('Example Series')[2]).searchParams.get('q'), 'Example Series disney plus');
+});
+
+test('Disney+ extracts native current-title artwork and metadata without logos, episodes or recommendations', t => {
+  const { api, doc } = environment(t); const page = doc(fixture('disney.html'));
+  const background = api.extract(page, disneyURL, 'backdrop'); const poster = api.extract(page, disneyURL, 'poster');
+  assert.equal(background.length, 1); assert.equal(poster.length, 1);
+  assert.match(background[0].url, /11111111-0000-4000-8000-000000000202/);
+  assert.match(poster[0].url, /22222222-0000-4000-8000-000000000203/);
+  assert.doesNotMatch(poster[0].url, /aspectRatio|width=|max=/);
+  assert.equal(poster[0].variants.length, 1); assert.equal(poster[0].orientation, 'portrait');
+  assert.equal(background[0].orientation, 'landscape'); assert.equal(poster[0].title, 'Example Series');
+  const metadata = api.providerMetadata(page, disneyURL + '/');
+  assert.equal(metadata.title, 'Example Series'); assert.equal(metadata.year, '2026'); assert.equal(metadata.type, 'TV series');
+  const wrong = disneyURL.replace('00000000', 'ffffffff');
+  assert.throws(() => api.extract(page, wrong, 'poster'), /No title artwork/);
+  assert.throws(() => api.providerMetadata(page, wrong), /unavailable/);
+  assert.equal(api.disneyArtwork(doc('<p>Sign in</p>'), 'poster', disneyURL).length, 0);
+  const script = page.querySelector('#__NEXT_DATA__'); const data = JSON.parse(script.textContent);
+  const blocks = data.props.pageProps.stitchDocument.mainContent;
+  const social = blocks.find(b => b._type === 'Metadata').metaTags.find(tag => tag.property === 'twitter:image');
+  social.content = 'https://disney.images.edge.bamgrid.com.evil.test/ripcut-delivery/v2/variant/disney/test/compose';
+  script.textContent = JSON.stringify(data);
+  assert.equal(api.disneyArtwork(page, 'poster', disneyURL).length, 0);
+  social.content = 'https://m.media-amazon.com/wrong.jpg'; script.textContent = JSON.stringify(data);
+  assert.equal(api.disneyArtwork(page, 'poster', disneyURL).length, 0);
+});
+
 test('direct URLs preserve provider handlers and accept arbitrary web sources', t => {
   const { api, doc } = environment(t);
   const prime = api.manualSource(' https://www.primevideo.com/-/de/detail/TESTMOVIE000000000000000001, ');
@@ -343,6 +395,47 @@ test('Kanopy performs an anonymous visitor handshake and retains the upload conf
   assert.equal(calls.filter(c => c.body).length, 0);
 });
 
+test('Disney+ reuses both artwork kinds and source helpers return native artwork without uploading', async t => {
+  const { app, api, calls, w, doc } = mockApp(t, url => url.includes('/backdrops/upload') ?
+    fixture('tv-backdrop.html').replace('TvSeries', 'Movie') : undefined); let reads = 0;
+  app.cross = async (_url, options) => { reads++; assert.equal(options.anonymous, true); return fixture('disney.html'); };
+  const title = { sources: [api.manualSource(disneyURL)] };
+  await app.fetchTitle(title, 'poster');
+  assert.equal(app.results.querySelectorAll('img').length, 1);
+  app.back(); await app.fetchTitle(title, 'backdrop');
+  assert.equal(app.results.querySelectorAll('img').length, 1); assert.equal(reads, 1);
+  assert.equal(calls.filter(c => c.body).length, 0);
+  const id = '11111111-1111-4111-8111-111111111111', key = 'tmdb-artwork-job:' + id;
+  const helper = environment(t, fixture('disney.html'), disneyURL + '#tmdb-artwork=' + id);
+  helper.w.GM_xmlhttpRequest = () => { throw new Error('Source helpers must not upload'); };
+  helper.stored.set(key, { id, url: disneyURL, kind: 'poster', state: 'waiting', expires: Date.now() + 60000 });
+  helper.api.start(); helper.w.document.body.lastElementChild.shadowRoot.querySelector('button').click();
+  const result = helper.stored.get(key);
+  assert.equal(result.state, 'ready'); assert.equal(result.assets.length, 1);
+  assert.match(result.assets[0].url, /22222222-0000/); assert.doesNotMatch(result.assets[0].url, /width=|aspectRatio=/);
+  // The receiving TMDB tab must accept Disney's CDN through the same helper validation as other providers.
+  const listeners = new Map(); let prepared;
+  const signal = app.newRequest();
+  app.prepare = async asset => { prepared = asset; return { blob: new w.Blob(['jpeg']), crop: { width: 1000, height: 1500 } }; };
+  w.GM_addValueChangeListener = (jobKey, callback) => { listeners.set(jobKey, callback); return 99; };
+  const card = w.document.createElement('div'); app.results.append(card);
+  const config = api.uploadConfig(doc(fixture('movie-poster.html')), 'poster', app.target);
+  const opener = w.document.createElement('button');
+  app.sourceTab(title.sources[0], card, config, signal, opener);
+  const [jobKey, callback] = [...listeners][0];
+  await callback(jobKey, null, result);
+  assert.match(prepared.url, /22222222-0000/); assert.equal(calls.filter(c => c.body).length, 0);
+});
+
+test('Disney+ rejects a landscape social asset as a poster and releases its decoded image', async t => {
+  const { api, w, doc, objectURLs } = environment(t);
+  w.Image = class { async decode() { this.naturalWidth = 3840; this.naturalHeight = 2160; } };
+  const asset = api.disneyArtwork(doc(fixture('disney.html')), 'poster', disneyURL)[0];
+  const config = api.uploadConfig(doc(fixture('movie-poster.html')), 'poster', { type: 'movie' });
+  await assert.rejects(api.prepare(asset, config, new w.AbortController().signal, async () => new w.Blob(['image'])), /requested orientation/);
+  assert.equal(objectURLs.size, 0);
+});
+
 test('direct URL UI fetches and remembers a source even if JustWatch returns nothing', async t => {
   const env = mockApp(t); const { app, stored, calls } = env;
   app.cross = async url => url.includes('justwatch') ? '{"data":{"searchTitles":{"edges":[]}}}' : fixture('apple-unavailable.html');
@@ -519,7 +612,7 @@ test('Google fallback handles empty or unrelated JustWatch matches and requires 
   jw = fixture('justwatch.json');
   app.cache.clear();
   await app.search('Example, I Love You');
-  assert.equal(reads.filter(url => url.includes('google.com')).length, 4);
+  assert.equal(reads.filter(url => url.includes('google.com')).length, 6);
   const apple = [...app.results.querySelectorAll('.google-card')].find(card => card.querySelector('.google-meta')?.textContent.includes('Apple TV'));
   [...apple.querySelectorAll('button')].find(b => b.textContent === 'Fetch poster').click(); await tick(); await tick();
   assert.equal(app.results.querySelectorAll('img').length, 1);
@@ -536,7 +629,7 @@ test('an exact usable JustWatch match skips Google; missing offers triggers it',
   await app.search('Fixture: A Movie'); assert.equal(searches, 0);
   for (const { node } of data.data.searchTitles.edges) node.offers = [];
   app.cache.clear();
-  await app.search('Fixture: A Movie'); assert.equal(searches, 2);
+  await app.search('Fixture: A Movie'); assert.equal(searches, 3);
   assert.match(app.results.textContent, /Searching in a background tab/);
 });
 
@@ -566,7 +659,7 @@ test('Google background exchange is automatic, request-specific, closes tabs, an
   };
   w.GM_addValueChangeListener = (key, callback) => { listeners.set(key, callback); return listeners.size; };
   app.cross = async () => '{}'; await app.search('Example, I Love You');
-  assert.equal(app.jobs.length, 2); assert.equal(tabs.length, 2); assert.ok(tabs.every(tab => !tab.options.active));
+  assert.equal(app.jobs.length, 3); assert.equal(tabs.length, 3); assert.ok(tabs.every(tab => !tab.options.active));
   const opened = tabs[0].url;
   const key = [...stored.keys()].find(k => k.startsWith('tmdb-artwork-job:'));
   const helper = environment(t, fixture('google.html'), opened);
@@ -615,10 +708,10 @@ test('Google attention recovery opens only on request, and pending background ta
   assert.ok(tabs.every(tab => !tab.options.active));
   timers.find(timer => timer.delay === 20000).fn();
   const recover = [...app.results.querySelectorAll('button')].find(b => b.textContent === 'Open Google to resolve');
-  assert.ok(recover); recover.click(); assert.equal(tabs[0].closed, true); assert.equal(tabs[2].options.active, true);
+  assert.ok(recover); recover.click(); assert.equal(tabs[0].closed, true); assert.equal(tabs[3].options.active, true);
   timers.filter(timer => timer.delay === 600000).forEach(timer => timer.fn());
   assert.ok(tabs.every(tab => tab.closed)); assert.equal(stored.size, 0);
-  recover.click(); assert.equal(tabs.length, 3); assert.equal(calls.length, 0);
+  recover.click(); assert.equal(tabs.length, 4); assert.equal(calls.length, 0);
 });
 
 test('exact-match highlighting requires the TMDB title and known year; popup uses an accessible corner close', async t => {
@@ -837,7 +930,7 @@ test('manual Google adds cards beside JustWatch and deduplicates concurrent and 
   assert.equal(app.results.firstElementChild, first);
   assert.equal(app.results.querySelectorAll('.google-section').length, 1);
   assert.equal(app.results.querySelectorAll('.google-card').length, 2);
-  assert.equal(reads.filter(url => url.includes('google.com')).length, 2);
+  assert.equal(reads.filter(url => url.includes('google.com')).length, 3);
 });
 
 test('cache shares results across app instances, isolates query/region keys, expires and clears without deleting preferences', async t => {
@@ -1012,7 +1105,7 @@ test('retrying an expired Google section closes any remaining old helpers', asyn
   const section = app.results.querySelector('.google-section');
   section.dataset.interrupted = 'true';
   await app.manualGoogle('Example');
-  assert.equal(tabs.length, 4); assert.equal(tabs[0].closed, true); assert.equal(tabs[1].closed, true);
+  assert.equal(tabs.length, 6); assert.ok(tabs.slice(0, 3).every(tab => tab.closed));
   assert.equal(app.results.querySelectorAll('.google-section').length, 1);
   app.cleanup(); assert.ok(tabs.every(tab => tab.closed));
 });

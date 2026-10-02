@@ -1,55 +1,23 @@
-# Discovery notes
+# Provider notes
 
-Checked September 12, 2026. Availability and search indexes vary by region and time.
+Public website interfaces are undocumented and may change. Catalog searches can
+miss titles whose pages still expose artwork. Discovery uses JustWatch, provider
+Google searches, and pasted URLs; results require selection and preview.
 
-## Unavailable titles
+- **Amazon:** read current-title hydration metadata, excluding recommendations.
+  Compare the original image with `SX4096_FMavif_PQ100`; requested size does not
+  guarantee native resolution.
+- **Apple TV:** match the title in `serialized-server-data` and resolve wide/tall
+  artwork templates at their declared dimensions.
+- **Kanopy:** initialize a visitor session with `/kapi/handshake`, then fetch the
+  title alias. Unwrap CDN proxies to recover originals. JWTs stay in memory and
+  are sent only to Kanopy's API.
+- **Disney+:** request anonymous public title HTML and match `pageId` in
+  `__NEXT_DATA__`. Read title-level hero and metadata sections. Remove Ripcut
+  size/crop parameters to recover native backgrounds and `twitter:image` portraits;
+  reject the wrong orientation. Legacy redirects may require **Open source tab**;
+  authenticated app shells may require a public entity link or direct image URL.
 
-**Example, I Love You** was absent from the tested JustWatch US results, Apple/iTunes
-search, and Prime Video search, but its [Prime page](https://www.primevideo.com/-/de/detail/TESTMOVIE000000000000000001)
-still exposed hero artwork. Its [Apple page](https://tv.apple.com/us/movie/example-i-love-you/umc.cmc.fixturemovietwo)
-provided a 1920×1080 background and a 400×574 poster (too small for TMDB).
-The captured JustWatch offers-history response contained no former provider URLs.
-
-The script searches JustWatch first, then Google for `<title> prime video`,
-`<title> apple tv`, and `<title> disney plus` when an exact match lacks supported links. Google results are
-deduplicated candidates requiring selection. Pasted provider URLs also work and
-are remembered per TMDB title.
-
-Version 1.5 also lets users run these Google queries manually alongside JustWatch
-results. Search and provider metadata are reused for 15 minutes across reloads.
-Arbitrary HTTP(S) URLs can supply a direct image or static HTML image candidates;
-the largest decoded image of the requested orientation that meets TMDB crop limits
-is selected. Generic extraction does not execute page scripts or crawl linked pages
-or stylesheets. Existing provider handlers remain the preferred path for title URLs.
-
-Google's HTTP response may require JavaScript. The script then uses a temporary
-background tab, observes rendered links, returns them automatically, and closes
-the tab. Consent/CAPTCHA still needs user action. This uses
-[Tampermonkey's tab API](https://www.tampermonkey.net/documentation.php?locale=en&q=GM_openInTab);
-background-tab integration is tested with mocks, not yet in live Chrome.
-
-## Artwork sources
-
-- **Amazon:** current-title hydration metadata; compare the original image with
-  `SX4096_FMavif_PQ100`. Requested size does not guarantee native resolution.
-- **Apple:** current-title artwork templates in `serialized-server-data`, resolved
-  at declared dimensions. A surviving page can be absent from catalog searches.
-- **Kanopy:** `/kapi/handshake` supplies a visitor JWT and storefront ID before
-  `/kapi/videos/alias/<alias>`. This fixed the metadata 401 in a live HTTP check.
-  Unwrap the image proxy to fetch originals; Example Journey supplied 1920×1080
-  landscape and 1548×2189 portrait images. Tokens stay in memory and go only to Kanopy.
-- **Disney+ (checked October 2, 2026):** the public
-  [Example Series entity page](https://www.disneyplus.com/browse/entity-00000000-0000-4000-8000-000000000201)
-  supplies title data in `__NEXT_DATA__.props.pageProps.stitchDocument.mainContent`.
-  Match `pageId` to the requested entity before reading `DetailEntityHero`,
-  `MediaDetails`, and `Metadata`; skip episodes, recommendations, offers, and title logos.
-  Removing `width`, `height`, `aspectRatio`, and `max` from its Ripcut image URLs
-  returned a native 3840×2160 hero and a 2000×2818 portrait from `twitter:image`,
-  whose webpage URL otherwise crops it to landscape. Decoded orientation is checked;
-  a title whose native social image is landscape-only cannot supply a poster this way.
-  Legacy `/movies/…` and `/series/…` links are recognized; redirects to a different
-  entity ID may need **Open source tab**. Authenticated app pages with no matching
-  public title data may require pasting the public entity link or a direct image URL.
-
-These website interfaces are undocumented and may change. Discovery is best effort;
-always verify the selected title and final JPEG before uploading.
+Generic webpages use static HTML images and metadata, without executing scripts
+or crawling linked pages. Google pages needing JavaScript use temporary helper
+tabs; consent/challenges need user action. Helper requests expire after ten minutes.

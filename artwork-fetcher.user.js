@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMDB Artwork Fetcher
 // @namespace    https://github.com/gizeto/artwork-fetcher
-// @version      1.6.0
+// @version      1.6.1
 // @author       gizeto
 // @homepageURL  https://github.com/gizeto/artwork-fetcher
 // @supportURL   https://github.com/gizeto/artwork-fetcher/issues
@@ -46,6 +46,7 @@
 // @connect      amazon.pl
 // @connect      primevideo.com
 // @connect      tv.apple.com
+// @connect      uts-api.itunes.apple.com
 // @connect      m.media-amazon.com
 // @connect      images-na.ssl-images-amazon.com
 // @connect      mzstatic.com
@@ -396,6 +397,40 @@
       if (isImageURL(url)) assets.push({ title: item.title, url, variants: [url] });
     }
     return assets;
+  }
+  function appleCatalogURL(doc, pageURL) {
+    // Bootstrap supplies the current storefront and anonymous catalog configuration.
+    // The hero's tall image is a separate asset from the catalog's posterArt.
+    if (!appleTitleItems(doc, pageURL).length) return null;
+    const entries = JSON.parse(doc.querySelector('#serialized-server-data').textContent).data || [];
+    const config = entries.map(entry => entry?.data).find(data => data?.configureParams && data?.configuration);
+    if (!config) return null;
+    const { sfh, locale, caller, v, pfm } = config.configureParams;
+    const utsk = config.configuration.utskProps?.utsk;
+    if (!(Number(sfh) > 0) || !locale || !utsk) throw new Error('Apple TV catalog configuration is incomplete. Open a fresh source tab.');
+    const type = new URL(pageURL).pathname.includes('/movie/') ? 'movies' : 'shows';
+    const url = new URL(`https://uts-api.itunes.apple.com/uts/v3/${type}/${encodeURIComponent(titlePageId(pageURL))}`);
+    for (const [key, value] of Object.entries({ sf: sfh, locale, caller: caller || 'web', v: v || '100', pfm: pfm || 'web', utsk })) {
+      url.searchParams.set(key, value);
+    }
+    return url.href;
+  }
+  function appleCatalogPoster(data, pageURL) {
+    const content = data.data?.content;
+    if (content?.id !== titlePageId(pageURL)) throw new Error('Apple TV catalog returned a different title.');
+    const art = content.images?.posterArt;
+    if (!art?.url || !(art.width > 0 && art.height > art.width)) throw new Error('Apple TV has no cover poster for this title.');
+    const url = art.url.replaceAll('{w}', art.width).replaceAll('{h}', art.height).replaceAll('{f}', 'jpg');
+    if (!isImageURL(url)) throw new Error('Apple TV returned an unsupported poster URL.');
+    return [{ title: content.title, url, variants: [url], orientation: 'portrait' }];
+  }
+  async function fetchApplePoster(doc, pageURL, request, signal) {
+    checkCancelled(signal);
+    const url = appleCatalogURL(doc, pageURL);
+    if (!url) return extract(doc, pageURL, 'poster');
+    const data = JSON.parse(await request(url, { signal, anonymous: true }));
+    checkCancelled(signal);
+    return appleCatalogPoster(data, pageURL);
   }
   function disneyTitleData(doc, pageURL) {
     const node = doc.querySelector('#__NEXT_DATA__');
@@ -831,14 +866,16 @@
       return dimensions;
     }
     async providerRecord(source, signal) {
-      return this.cached('provider:' + source.url, signal, async () => {
+      // Refresh Apple records that older versions cached with tall hero artwork as the poster.
+      return this.cached((source.provider === 'Apple TV' ? 'provider:apple-poster-v2:' : 'provider:') + source.url, signal, async () => {
         const record = { artwork: {}, errors: {} };
         const data = source.provider === 'Kanopy' ? await kanopyData(source.url, this.cross, signal) :
           // Disney's public page supplies title artwork; an authenticated response can be only an app shell.
           parse(await this.cross(source.url, { signal, ...(source.provider === 'Disney+' ? { anonymous: true } : {}) }));
         checkCancelled(signal);
         for (const kind of ['backdrop', 'poster']) {
-          try { record.artwork[kind] = source.provider === 'Kanopy' ? kanopyArtwork(data, kind, source.url) : extract(data, source.url, kind); }
+          try { record.artwork[kind] = source.provider === 'Kanopy' ? kanopyArtwork(data, kind, source.url) :
+            source.provider === 'Apple TV' && kind === 'poster' ? await fetchApplePoster(data, source.url, this.cross, signal) : extract(data, source.url, kind); }
           catch (e) { record.errors[kind] = e.message; }
         }
         if (source.provider !== 'Kanopy') {
@@ -1522,6 +1559,8 @@
             if (!response.ok) throw new Error(`Kanopy returned HTTP ${response.status}. Wait for the title page to finish loading, then try again.`);
             return response.text();
           }, root.AbortSignal.timeout(30000));
+        } else if (provider(root.location.href) === 'Apple TV' && job.kind === 'poster') {
+          assets = await fetchApplePoster(root.document, root.location.href, crossRequest, root.AbortSignal.timeout(30000));
         } else assets = extract(root.document, root.location.href, job.kind);
         const pending = GM_getValue(key);
         if (!pending || pending.expires < Date.now()) throw new Error('Request expired. Open a new source tab from TMDB.');
@@ -1540,7 +1579,7 @@
     if (target && !root.document.getElementById('tmdb-artwork')) new App(target);
   }
   const api = { QUERY, Cache, pageImages, webURL, regions, targetFromPage, exactMatch, provider, canonicalProvider, searchResults, amazonVariants,
-    amazonArtwork, appleArtwork, disneyArtwork, kanopyAPI, kanopyArtwork, fetchKanopy, manualSource, discoveryLinks, googleQueries, googleResults, cleanGoogleTitle, providerMetadata, crossRequest, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
+    amazonArtwork, appleArtwork, appleCatalogURL, appleCatalogPoster, fetchApplePoster, disneyArtwork, kanopyAPI, kanopyArtwork, fetchKanopy, manualSource, discoveryLinks, googleQueries, googleResults, cleanGoogleTitle, providerMetadata, crossRequest, extract, uploadConfig, cropPlan, filename, multipart, uploadResult, prepare, App, helper, start };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else start();
 })(globalThis);

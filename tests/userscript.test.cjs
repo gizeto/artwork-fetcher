@@ -110,6 +110,95 @@ test('Apple title selection tolerates trailing slashes without selecting another
   }
 });
 
+function appleCatalogPage() {
+  const html = fixture('apple.html');
+  const data = JSON.parse(html.match(/<script[^>]*>(.*)<\/script>/s)[1]);
+  data.data.unshift({ data: { configureParams: { sfh: 143444, locale: 'en-GB', caller: 'web', v: '100', pfm: 'web' },
+    configuration: { utskProps: { utsk: 'fixture-anonymous-catalog-config' } } } });
+  return `<script id="serialized-server-data" type="application/json">${JSON.stringify(data)}</script>`;
+}
+
+const appleCatalogPageURL = 'https://tv.apple.com/gb/movie/fixture---a-movie/umc.cmc.fixturemovieone';
+
+test('Apple catalog selects the title cover poster rather than tall hero artwork or recommendations', async t => {
+  const { api, doc, w } = environment(t);
+  const page = doc(appleCatalogPage()), signal = new w.AbortController().signal;
+  const assets = await api.fetchApplePoster(page, appleCatalogPageURL + '/', async (url, options) => {
+    const u = new URL(url);
+    assert.equal(u.origin, 'https://uts-api.itunes.apple.com');
+    assert.equal(u.pathname, '/uts/v3/movies/umc.cmc.fixturemovieone');
+    assert.equal(u.searchParams.get('sf'), '143444'); assert.equal(u.searchParams.get('locale'), 'en-GB');
+    assert.equal(u.searchParams.get('utsk'), 'fixture-anonymous-catalog-config');
+    assert.equal(options.signal, signal); assert.equal(options.anonymous, true);
+    return fixture('apple-catalog.json');
+  }, signal);
+  assert.equal(assets.length, 1); assert.equal(assets[0].title, 'Fixture - A Movie');
+  assert.match(assets[0].url, /fixture-cover\/ticket.fixture.jpg\/1400x2100CA.TVA23C01.jpg$/);
+  assert.equal(assets[0].orientation, 'portrait'); assert.equal(assets[0].variants[0], assets[0].url);
+  assert.equal(api.appleCatalogURL(page, appleCatalogPageURL + '-wrong'), null);
+  const script = page.querySelector('script'); script.textContent = script.textContent.replaceAll('/movie/', '/show/');
+  assert.match(api.appleCatalogURL(page, appleCatalogPageURL.replace('/movie/', '/show/')), /\/uts\/v3\/shows\//);
+});
+
+test('Apple catalog rejects mismatched titles, missing posters and unsafe or landscape images', async t => {
+  const { api, doc, w } = environment(t);
+  const data = JSON.parse(fixture('apple-catalog.json'));
+  data.data.content.id = 'umc.cmc.wrongtitle';
+  assert.throws(() => api.appleCatalogPoster(data, appleCatalogPageURL), /different title/);
+  data.data.content.id = 'umc.cmc.fixturemovieone';
+  const poster = data.data.content.images.posterArt;
+  delete data.data.content.images.posterArt;
+  assert.throws(() => api.appleCatalogPoster(data, appleCatalogPageURL), /no cover poster/);
+  data.data.content.images.posterArt = { ...poster, height: 800 };
+  assert.throws(() => api.appleCatalogPoster(data, appleCatalogPageURL), /no cover poster/);
+  data.data.content.images.posterArt = { ...poster, url: 'https://attacker.test/image.jpg' };
+  assert.throws(() => api.appleCatalogPoster(data, appleCatalogPageURL), /unsupported poster URL/);
+  const signal = new w.AbortController().signal;
+  await assert.rejects(api.fetchApplePoster(doc(appleCatalogPage()), appleCatalogPageURL, async () => { throw new Error('HTTP 503'); }, signal), /HTTP 503/);
+  const controller = new w.AbortController();
+  await assert.rejects(api.fetchApplePoster(doc(appleCatalogPage()), appleCatalogPageURL, async () => {
+    controller.abort(); return fixture('apple-catalog.json');
+  }, controller.signal), /Cancelled/);
+  const legacy = await api.fetchApplePoster(doc(fixture('apple.html')), appleCatalogPageURL, async () => { assert.fail('Legacy page has no catalog configuration'); }, signal);
+  assert.match(legacy[0].url, /fixture-poster\/2000x3000.jpg$/);
+});
+
+test('Apple provider records cache cover posters and preserve background fetching even if the catalog fails', async t => {
+  const { app, w, api } = mockApp(t);
+  const calls = [], signal = new w.AbortController().signal;
+  const source = api.manualSource(appleCatalogPageURL);
+  // Records saved by previous versions contain the tall hero, so they must be refreshed.
+  app.cache.set('provider:' + source.url, { artwork: { poster: [{ url: 'wrong-tall-hero' }] } });
+  app.cross = async url => { calls.push(url); return url === source.url ? appleCatalogPage() : fixture('apple-catalog.json'); };
+  const record = await app.providerRecord(source, signal);
+  assert.match(record.artwork.poster[0].url, /fixture-cover/);
+  assert.match(record.artwork.backdrop[0].url, /fixture-background\/1920x1080.jpg$/);
+  await app.providerRecord(source, signal); assert.equal(calls.length, 2);
+  app.cache.clear();
+  app.cross = async url => { if (url !== source.url) throw new Error('HTTP 503'); return appleCatalogPage(); };
+  const failed = await app.providerRecord(source, signal);
+  assert.equal(failed.artwork.poster, undefined); assert.match(failed.errors.poster, /HTTP 503/);
+  assert.equal(failed.artwork.backdrop.length, 1);
+});
+
+test('Apple source-tab helper sends the catalog cover poster without catalog configuration or uploading', async t => {
+  const id = '11111111-1111-4111-8111-111111111111', key = 'tmdb-artwork-job:' + id;
+  const { api, w, stored } = environment(t, appleCatalogPage(), appleCatalogPageURL + '#tmdb-artwork=' + id);
+  stored.set(key, { id, url: appleCatalogPageURL, kind: 'poster', state: 'waiting', expires: Date.now() + 60000 });
+  const calls = [];
+  w.GM_xmlhttpRequest = options => {
+    calls.push(options);
+    options.onload({ status: 200, responseText: fixture('apple-catalog.json') });
+    return { abort() {} };
+  };
+  api.helper(); w.document.body.lastElementChild.shadowRoot.querySelector('button').click(); await tick();
+  assert.equal(calls.length, 1); assert.equal(calls[0].method, 'GET'); assert.equal(calls[0].anonymous, true);
+  assert.match(calls[0].url, /\/uts\/v3\/movies\/umc.cmc.fixturemovieone\?/);
+  const result = stored.get(key);
+  assert.equal(result.state, 'ready'); assert.match(result.assets[0].url, /fixture-cover/);
+  assert.doesNotMatch(JSON.stringify(result), /fixture-anonymous-catalog-config|utsk/);
+});
+
 test('Kanopy unwraps native images and selects only the requested title and artwork kind', t => {
   const { api } = environment(t);
   const url = 'https://www.kanopy.com/en/product/justwatch-990000003?utm_source=justwatch';

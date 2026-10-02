@@ -7,8 +7,12 @@ Google searches, and pasted URLs; results require selection and preview.
 - **Amazon:** read current-title hydration metadata, excluding recommendations.
   Compare the original image with `SX4096_FMavif_PQ100`; requested size does not
   guarantee native resolution.
-- **Apple TV:** match the title in `serialized-server-data` and resolve wide/tall
-  artwork templates at their declared dimensions.
+- **Apple TV:** match the title in `serialized-server-data`. Backgrounds use the
+  wide hero artwork. Posters use the public catalog's title-level `posterArt`,
+  with the page's storefront and anonymous catalog configuration, at its declared
+  dimensions. The tall hero image is separate artwork; it is used only on older
+  pages without catalog configuration. Catalog failures can be retried with
+  **Open source tab**.
 - **Kanopy:** initialize a visitor session with `/kapi/handshake`, then fetch the
   title alias. Unwrap CDN proxies to recover originals. JWTs stay in memory and
   are sent only to Kanopy's API.

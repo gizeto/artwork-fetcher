@@ -724,13 +724,27 @@
     .toolbar { position:fixed; bottom:18px; right:18px; display:flex; flex-wrap:wrap; gap:7px; padding:10px; background:#102435; border:1px solid #426279; border-radius:10px; box-shadow:0 4px 18px #0005; }
     .overlay { position:fixed; inset:0; background:#0009; display:flex; align-items:center; justify-content:center; padding:20px; }
     .panel { width:1000px; max-width:100%; max-height:92vh; overflow:auto; background:#102435; padding:22px; border:1px solid #426279; border-radius:12px; }
-    .dialog-header { display:flex; align-items:center; gap:16px; position:sticky; top:-22px; margin:-22px -22px 14px; padding:16px 22px; background:#102435; z-index:1; }
-    .dialog-header h2 { margin:0; flex:1; } .close { font-size:26px; line-height:1; width:36px; height:36px; padding:0; flex-shrink:0; background:transparent; color:#bcd0df; }
+    .dialog-header { display:grid; grid-template-columns:36px minmax(0,1fr) 36px; align-items:center; gap:16px; position:sticky; top:-22px; margin:-22px -22px 6px; padding:16px 22px 10px; background:#102435; z-index:1; }
+    .dialog-header h2 { grid-column:2; margin:0; text-align:center; overflow-wrap:anywhere; }
+    .icon-button { font-size:26px; line-height:1; width:36px; height:36px; padding:0; background:transparent; color:#bcd0df; }
+    .back { grid-column:1; grid-row:1; } .close { grid-column:3; grid-row:1; }
     h2 { margin:0 0 14px; font-size:22px; } p { margin:10px 0; } a { color:#69d5fb; } label { display:inline-flex; gap:8px; align-items:center; }
     input,select { padding:7px; border:1px solid #7591a5; border-radius:4px; background:#fff; color:#122433; }
     .row { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:12px 0; } .row input { flex:1; min-width:180px; }
     .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(270px,100%),1fr)); gap:16px; }
+    .artwork-grid { grid-template-columns:repeat(auto-fill,minmax(min(270px,100%),1fr)); align-items:start; }
     .card { padding:14px; border:1px solid #426279; border-radius:8px; overflow:hidden; }
+    .artwork-heading { text-align:center; margin:0 0 14px; }
+    .artwork-sources { display:flex; flex-wrap:wrap; gap:4px 12px; }
+    .artwork-provider-name, .artwork-sources a { white-space:nowrap; }
+    .artwork-footer { display:grid; gap:12px; margin-top:12px; padding-top:12px; border-top:1px solid #426279; }
+    .artwork-language { display:grid; grid-template-columns:auto minmax(0,1fr); gap:12px; }
+    .artwork-language input { width:100%; min-width:0; }
+    .artwork-actions { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:stretch; gap:10px; }
+    .artwork-actions button { padding:9px 10px; border:1px solid transparent; }
+    .save-jpeg { display:flex; align-items:center; justify-content:center; padding:9px 10px; border:1px solid #426279; border-radius:6px; text-decoration:none; }
+    .save-jpeg:hover { background:#19384d; border-color:#69d5fb; }
+    @media (max-width:420px) { .artwork-actions { grid-template-columns:1fr; } }
     .exact-match { border-color:#648c7d; background:#16332f; } .match-label { display:block; color:#abcabb; font-size:12px; margin:4px 0; }
     details { margin-top:18px; } .google-section { grid-column:1/-1; }
     .google-heading { display:block; font-size:16px; margin-bottom:14px; }
@@ -739,8 +753,19 @@
     .google-card p { margin:0; } .google-meta, .google-summary { color:#b3c5d3; font-size:13px; }
     .google-actions { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding-top:12px; margin-top:auto; }
     .google-note { font-size:12px; color:#b3c5d3; } .google-summary { margin:12px 0 0; }
-    img { display:block; width:100%; height:260px; object-fit:contain; background:#07111a; cursor:zoom-in; }
-    .full { max-height:65vh; height:auto; } .error { color:#ffc5b8; } .status { white-space:pre-wrap; }
+    img { display:block; width:100%; height:auto; }
+    .artwork-image { display:block; position:relative; width:100%; padding:0; overflow:hidden; background:transparent; cursor:zoom-in; }
+    .artwork-image:hover { background:transparent; }
+    .artwork-image img { aspect-ratio:16/9; object-fit:cover; } .artwork-image.poster img { aspect-ratio:2/3; }
+    .enlarge-icon { position:absolute; right:8px; bottom:8px; padding:2px 7px; border-radius:4px; background:#102435cc; font-size:20px; line-height:1.4; }
+    .image-viewer { position:fixed; inset:0; z-index:2; display:flex; flex-direction:column; background:#07111af5; padding:16px; }
+    .image-viewer .dialog-header { position:static; flex-shrink:0; margin:0 0 12px; padding:0; background:transparent; }
+    .viewer-stage { flex:1; min-height:0; overflow:auto; display:flex; align-items:center; justify-content:center; }
+    .viewer-stage img { width:auto; height:auto; max-width:100%; max-height:100%; flex-shrink:0; object-fit:contain; }
+    .viewer-stage.actual-size { display:block; } .viewer-stage.actual-size img { max-width:none; max-height:none; margin:auto; }
+    .viewer-controls { display:flex; justify-content:center; flex-shrink:0; padding-top:12px; }
+    button:focus-visible { outline:2px solid #69d5fb; outline-offset:3px; }
+    .error { color:#ffc5b8; } .status { white-space:pre-wrap; } .status:empty { display:none; }
   `;
 
   class App {
@@ -750,6 +775,7 @@
       this.cross = deps.cross || crossRequest;
       this.cache = deps.cache || new Cache();
       this.pending = new Map();
+      this.assetPreviews = new WeakMap();
       this.decode = deps.decode || decode;
       this.prepare = deps.prepare || ((asset, config, signal) => prepare(asset, config, signal, (url, active) => this.download(url, active)));
       this.waf = deps.waf || waf;
@@ -870,6 +896,7 @@
       return [{ url: best.url, variants: [best.url], generic: true, blob: best.blob }];
     }
     cleanup() {
+      this.closeImage(false);
       this.controller?.abort();
       this.urls.forEach(url => root.URL.revokeObjectURL(url));
       this.urls = [];
@@ -895,9 +922,12 @@
       this.overlay = element('div', null, { class: 'overlay' });
       this.panel = element('div', null, { class: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
       const header = element('div', null, { class: 'dialog-header' });
+      this.backButton = button('←', () => this.back());
+      this.backButton.className = 'icon-button back'; this.backButton.hidden = true;
+      this.backButton.setAttribute('aria-label', 'Back to results'); this.backButton.title = 'Back to results';
       this.close = button('×', () => { if (!this.busy) { this.cleanup(); this.overlay.remove(); } });
-      this.close.className = 'close'; this.close.setAttribute('aria-label', 'Close'); this.close.title = 'Close';
-      header.append(element('h2', title), this.close);
+      this.close.className = 'icon-button close'; this.close.setAttribute('aria-label', 'Close'); this.close.title = 'Close';
+      header.append(this.backButton, element('h2', title), this.close);
       this.panel.append(header); this.overlay.append(this.panel); this.shadow.append(this.overlay);
       this.close.focus(); return true;
     }
@@ -932,6 +962,7 @@
     back() {
       if (this.busy || !this.previewing) return;
       this.newRequest(); this.previewing = false;
+      this.backButton.hidden = true;
       this.preview.remove(); this.preview = null;
       this.discovery.hidden = false;
       this.results = this.searchView.results; this.status = this.searchView.status;
@@ -1189,10 +1220,11 @@
       this.searchView = { results: this.results, status: this.status, scroll: this.panel.scrollTop, focus: this.shadow.activeElement };
       this.discovery.hidden = true; this.previewing = true;
       this.preview = element('div');
-      this.results = element('div', null, { class: 'grid' }); this.status = element('p', '', { class: 'status', role: 'status' });
-      this.preview.append(button('Back to results', () => this.back()), element('h3', kind === 'poster' ? 'Poster' : 'Background'), this.status, this.results);
+      this.results = element('div', null, { class: 'grid artwork-grid' }); this.status = element('p', '', { class: 'status', role: 'status' });
+      this.backButton.hidden = false;
+      this.preview.append(element('h3', kind === 'poster' ? 'Poster' : 'Background', { class: 'artwork-heading' }), this.status, this.results);
       this.panel.append(this.preview); this.panel.scrollTop = 0;
-      this.preview.querySelector('button').focus({ preventScroll: true });
+      this.backButton.focus({ preventScroll: true });
       const { results, status } = this;
       status.textContent = 'Reading TMDB image limits…';
       let config;
@@ -1203,11 +1235,11 @@
         return;
       }
       if (signal.aborted) return;
-      status.textContent = 'Fetching artwork. Each card previews the exact JPEG that will be uploaded.';
+      status.textContent = '';
       for (const source of title.sources) {
         if (signal.aborted) return;
         const card = element('div', null, { class: 'card' });
-        card.append(link(`${source.provider} · ${source.countries.join(', ')}`, source.url)); results.append(card);
+        this.addArtworkSource(card, source); results.append(card);
         const state = element('p', 'Loading…'); card.append(state);
         try {
           let assets;
@@ -1228,33 +1260,112 @@
         }
       }
     }
+    addArtworkSource(card, source) {
+      if (!source.url) return;
+      let sources = card.querySelector('.artwork-sources');
+      if (!sources) {
+        sources = element('div', null, { class: 'artwork-sources' }); card.prepend(sources);
+      }
+      let group = [...sources.querySelectorAll('.artwork-provider')].find(item => item.dataset.provider === source.provider);
+      if (!group) {
+        group = element('span', null, { class: 'artwork-provider', 'data-provider': source.provider });
+        group.append(element('span', source.provider, { class: 'artwork-provider-name' })); sources.append(group);
+      }
+      for (const region of source.countries?.length ? source.countries : ['Source']) {
+        if ([...group.querySelectorAll('a')].some(item => item.href === source.url && item.textContent === region)) continue;
+        const regionLink = link(region, source.url);
+        regionLink.title = `${source.provider} · ${region}`;
+        regionLink.setAttribute('aria-label', regionLink.title);
+        group.append(' · ', regionLink);
+      }
+    }
     async addAssets(assets, source, card, config, signal) {
+      let previews = this.assetPreviews.get(signal);
+      if (!previews) { previews = new Map(); this.assetPreviews.set(signal, previews); }
       for (const asset of assets) {
         if (signal.aborted) return;
-        const prepared = await this.prepare(asset, config, signal);
-        if (signal.aborted) return;
+        const key = JSON.stringify([config.kind, asset.url || asset.variants[0]]);
+        const existing = previews.get(key);
+        if (existing) {
+          await existing.prepared;
+          if (signal.aborted) return;
+          this.addArtworkSource(existing.card, source);
+          continue;
+        }
+        // Reserve the URL before preparing so overlapping source helpers share the same work.
+        const entry = { card, prepared: this.prepare(asset, config, signal) }; previews.set(key, entry);
+        let prepared;
+        try { prepared = await entry.prepared; checkCancelled(signal); }
+        catch (error) { previews.delete(key); throw error; }
+        this.addArtworkSource(card, source);
         const url = root.URL.createObjectURL(prepared.blob); this.urls.push(url);
         const block = element('div');
-        const img = element('img', null, { src: url, alt: asset.title || this.target.title });
-        img.addEventListener('click', () => img.classList.toggle('full'));
-        block.append(element('p', asset.title || this.target.title), img,
-          element('p', `Source ${prepared.sourceWidth}×${prepared.sourceHeight} → JPEG ${prepared.crop.width}×${prepared.crop.height} · ${(prepared.blob.size / 1024).toFixed(0)} KB. Center crop; click image to enlarge.`));
+        const title = asset.title || this.target.title;
+        const img = element('img', null, { src: url, alt: title, width: prepared.crop.width, height: prepared.crop.height });
+        const enlarge = button(null, () => this.showImage(url, title, prepared.crop, enlarge));
+        enlarge.className = 'artwork-image' + (config.kind === 'poster' ? ' poster' : '');
+        enlarge.setAttribute('aria-label', `Enlarge ${title}`); enlarge.title = 'Enlarge image';
+        enlarge.append(img, element('span', '⤢', { class: 'enlarge-icon', 'aria-hidden': 'true' }));
+        block.append(element('p', title), enlarge,
+          element('p', `${prepared.sourceWidth}×${prepared.sourceHeight} → JPEG ${prepared.crop.width}×${prepared.crop.height} · ${(prepared.blob.size / 1024).toFixed(0)} KB`));
         if (config.kind === 'poster' && prepared.sourceWidth >= prepared.sourceHeight) {
           block.append(element('p', 'This provider artwork is landscape. The poster crop removes the sides; check that titles and faces remain intact.', { class: 'error' }));
         }
-        const language = element('input', null, { value: config.kind === 'backdrop' ? 'xx-XX' : 'en-US', list: 'artwork-languages', 'aria-label': 'Image language' });
-        const label = element('label', 'Image language '); label.append(language); block.append(label);
+        const language = element('input', null, { value: config.kind === 'backdrop' ? 'xx-XX' : 'en-US', list: 'artwork-languages', 'aria-label': 'Language' });
+        const label = element('label', 'Language', { class: 'artwork-language' }); label.append(language);
         if (!this.panel.querySelector('#artwork-languages')) {
           const list = element('datalist', null, { id: 'artwork-languages' });
           for (const [value, text] of [['xx-XX', 'No language'], ['en-US', 'English'], ['en-GB', 'English (UK)'], ['pl-PL', 'Polish'], ['de-DE', 'German'], ['fr-FR', 'French'], ['es-ES', 'Spanish'], ['it-IT', 'Italian'], ['ja-JP', 'Japanese']]) list.append(element('option', text, { value }));
           this.panel.append(list);
         }
         const name = filename(this.target, config.kind);
-        const row = element('div', null, { class: 'row' });
-        const save = link('Save JPEG', url); save.setAttribute('download', name);
+        const footer = element('div', null, { class: 'artwork-footer' });
+        const row = element('div', null, { class: 'artwork-actions' });
+        const save = link('Save JPEG', url); save.setAttribute('download', name); save.className = 'save-jpeg';
         const upload = button('Upload this image', () => this.upload(prepared, name, language.value, config, block, upload));
-        row.append(upload, save); block.append(row); card.append(block);
+        row.append(upload, save); footer.append(label, row); block.append(footer); card.append(block);
       }
+      if (!card.querySelector('.artwork-image')) card.remove();
+    }
+    showImage(url, title, dimensions, trigger) {
+      if (this.busy) return;
+      this.closeImage(false);
+      this.imageTrigger = trigger;
+      this.viewer = element('div', null, { class: 'image-viewer', role: 'dialog', 'aria-modal': 'true', 'aria-label': `Image preview · ${title}` });
+      const header = element('div', null, { class: 'dialog-header' });
+      const close = button('×', () => this.closeImage());
+      close.className = 'icon-button close'; close.setAttribute('aria-label', 'Close image preview'); close.title = 'Close image preview';
+      header.append(element('h2', title), close);
+      const stage = element('div', null, { class: 'viewer-stage', tabindex: '0', 'aria-label': 'Image preview; scroll to inspect at 100%' });
+      const img = element('img', null, { src: url, alt: title, width: dimensions.width, height: dimensions.height });
+      stage.append(img);
+      const zoom = button('View at 100%', () => {
+        const actual = stage.classList.toggle('actual-size');
+        zoom.textContent = actual ? 'Fit to screen' : 'View at 100%';
+        zoom.setAttribute('aria-pressed', String(actual));
+        stage.scrollTop = 0; stage.scrollLeft = 0;
+      });
+      zoom.setAttribute('aria-pressed', 'false');
+      const controls = element('div', null, { class: 'viewer-controls' }); controls.append(zoom);
+      this.viewer.append(header, stage, controls);
+      this.viewer.addEventListener('click', event => { if (event.target === stage || event.target === this.viewer) this.closeImage(); });
+      this.viewer.addEventListener('keydown', event => {
+        if (event.key === 'Escape') { event.preventDefault(); this.closeImage(); }
+        if (event.key === 'Tab') {
+          const controls = [close, stage, zoom];
+          const index = controls.indexOf(this.shadow.activeElement);
+          event.preventDefault(); controls[(index + (event.shiftKey ? -1 : 1) + controls.length) % controls.length].focus();
+        }
+      });
+      this.panel.inert = true; this.panel.setAttribute('aria-hidden', 'true');
+      this.overlay.append(this.viewer); close.focus({ preventScroll: true });
+    }
+    closeImage(restoreFocus = true) {
+      if (!this.viewer) return;
+      this.viewer.remove(); this.viewer = null;
+      this.panel.inert = false; this.panel.removeAttribute('aria-hidden');
+      if (restoreFocus && this.imageTrigger?.isConnected) this.imageTrigger.focus({ preventScroll: true });
+      this.imageTrigger = null;
     }
     lock(value) {
       this.busy = value;

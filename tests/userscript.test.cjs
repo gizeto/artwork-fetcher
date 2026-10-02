@@ -275,11 +275,48 @@ async function addPreview(env) {
   return [...card.querySelectorAll('button')].find(b => b.textContent === 'Upload this image');
 }
 
+test('image viewer supports detail inspection, keyboard navigation, dismissal and focus restoration without uploading', async t => {
+  const env = mockApp(t);
+  const { app, w, calls, objectURLs } = env;
+  await addPreview(env);
+  const trigger = app.panel.querySelector('.artwork-image');
+  trigger.focus(); trigger.click();
+  const viewer = app.viewer;
+  const close = viewer.querySelector('[aria-label="Close image preview"]');
+  const stage = viewer.querySelector('.viewer-stage');
+  const zoom = viewer.querySelector('.viewer-controls button');
+  const image = stage.querySelector('img');
+  assert.equal(image.src, trigger.querySelector('img').src, 'inspect the exact JPEG shown in the card');
+  assert.equal(image.width, 2000); assert.equal(image.height, 3000);
+  assert.equal(app.panel.inert, true); assert.equal(app.panel.getAttribute('aria-hidden'), 'true');
+  assert.equal(app.shadow.activeElement, close);
+  close.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));
+  assert.equal(app.shadow.activeElement, zoom, 'Shift+Tab wraps inside the image dialog');
+  zoom.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+  assert.equal(app.shadow.activeElement, close);
+  zoom.click();
+  assert.equal(stage.classList.contains('actual-size'), true);
+  assert.equal(zoom.textContent, 'Fit to screen'); assert.equal(zoom.getAttribute('aria-pressed'), 'true');
+  stage.scrollTop = 100; stage.scrollLeft = 50; zoom.click();
+  assert.equal(stage.classList.contains('actual-size'), false);
+  assert.equal(stage.scrollTop, 0); assert.equal(stage.scrollLeft, 0);
+  image.click(); assert.equal(app.viewer, viewer, 'clicking artwork keeps it open');
+  zoom.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal(app.viewer, null); assert.equal(app.panel.inert, false);
+  assert.equal(app.panel.hasAttribute('aria-hidden'), false); assert.equal(app.shadow.activeElement, trigger);
+  assert.equal(objectURLs.size, 1, 'closing the viewer keeps the card JPEG usable');
+  trigger.click(); app.viewer.querySelector('.viewer-stage').click(); assert.equal(app.viewer, null);
+  trigger.click(); app.viewer.querySelector('[aria-label="Close image preview"]').click(); assert.equal(app.viewer, null);
+  trigger.click(); app.cleanup();
+  assert.equal(app.viewer, null); assert.equal(objectURLs.size, 0, 'cleanup closes the viewer before releasing the JPEG');
+  assert.equal(calls.length, 0, 'inspecting the image never submits an upload');
+});
+
 test('typing a language stays inside the popup and leaves normal keyboard behavior available', async t => {
   const env = mockApp(t);
   const { app, w, calls } = env;
   await addPreview(env);
-  const language = app.panel.querySelector('[aria-label="Image language"]');
+  const language = app.panel.querySelector('[aria-label="Language"]');
   const pageKeys = [];
   const inputKeys = [];
   for (const type of ['keydown', 'keypress', 'keyup']) {
@@ -378,6 +415,71 @@ test('one failed provider does not discard another provider preview', async t =>
   assert.match(app.results.textContent, /Provider blocked/);
   assert.match(app.results.textContent, /Open source tab/);
   assert.equal(calls.filter(c => c.body).length, 0);
+});
+
+test('identical artwork URLs across Amazon regions prepare once and share one card with both source links', async t => {
+  const { app, api, calls, objectURLs } = mockApp(t);
+  const reads = [], prepared = [];
+  app.cross = async url => { reads.push(url); return fixture('amazon.html'); };
+  const originalPrepare = app.prepare;
+  app.prepare = async (asset, ...args) => { prepared.push(asset.url); return originalPrepare(asset, ...args); };
+  const title = { sources: [
+    api.manualSource('https://www.amazon.com/gp/video/detail/TESTMOVIE1'),
+    api.manualSource('https://www.amazon.co.uk/gp/video/detail/TESTMOVIE1'),
+  ] };
+  await app.fetchTitle(title, 'poster');
+  assert.equal(reads.length, 2, 'read each regional page to discover whether its artwork differs');
+  assert.equal(prepared.length, 1, 'skip downloading, decoding and encoding the duplicate asset');
+  assert.equal(app.results.querySelectorAll('.card').length, 1, 'omit the empty regional card');
+  assert.equal(app.results.querySelectorAll('.artwork-image').length, 1);
+  assert.deepEqual([...app.results.querySelectorAll('.artwork-sources a')].map(a => a.href), title.sources.map(s => s.url));
+  assert.equal(app.results.querySelectorAll('.artwork-footer').length, 1);
+  assert.equal(objectURLs.size, 1); assert.equal(calls.filter(c => c.body).length, 0);
+  app.back(); await app.fetchTitle(title, 'poster');
+  assert.equal(prepared.length, 2, 'a new preview restores its own image and controls');
+  assert.equal(app.results.querySelectorAll('.artwork-image').length, 1);
+  assert.equal(objectURLs.size, 1, 'previous preview URLs are released');
+});
+
+test('overlapping source responses share preparation while distinct URLs and artwork kinds remain separate', async t => {
+  const { app, w, api, doc } = mockApp(t);
+  const signal = app.controller.signal;
+  const config = api.uploadConfig(doc(fixture('movie-poster.html')), 'poster', app.target);
+  const asset = { title: 'Shared', url: 'https://m.media-amazon.com/shared.jpg', variants: ['https://m.media-amazon.com/shared.jpg'] };
+  const sources = [
+    { provider: 'Amazon', countries: ['US'], url: 'https://www.amazon.com/gp/video/detail/TESTMOVIE1' },
+    { provider: 'Amazon', countries: ['GB'], url: 'https://www.amazon.co.uk/gp/video/detail/TESTMOVIE1' },
+  ];
+  const cards = sources.map(() => { const card = w.document.createElement('div'); app.results.append(card); return card; });
+  let release, prepares = 0;
+  const originalPrepare = app.prepare;
+  app.prepare = async (...args) => { prepares++; await new Promise(resolve => { release = resolve; }); return originalPrepare(...args); };
+  const first = app.addAssets([asset, asset], sources[0], cards[0], config, signal);
+  const second = app.addAssets([asset], sources[1], cards[1], config, signal);
+  assert.equal(prepares, 1); release(); await Promise.all([first, second]);
+  assert.equal(app.results.querySelectorAll('.artwork-image').length, 1);
+  assert.equal(app.results.querySelectorAll('.artwork-sources a').length, 2);
+  assert.equal(app.results.querySelector('.artwork-sources').textContent, 'Amazon · US · GB');
+  assert.deepEqual([...app.results.querySelectorAll('.artwork-sources a')].map(a => [a.textContent, a.href, a.getAttribute('aria-label')]),
+    sources.map(s => [s.countries[0], s.url, `${s.provider} · ${s.countries[0]}`]));
+  assert.equal(cards[1].isConnected, false);
+  app.prepare = async (...args) => { prepares++; return originalPrepare(...args); };
+  await app.addAssets([{ ...asset, url: asset.url + '?language=pl' }], sources[0], cards[0], config, signal);
+  await app.addAssets([asset], sources[0], cards[0], { ...config, kind: 'backdrop' }, signal);
+  assert.equal(prepares, 3); assert.equal(app.results.querySelectorAll('.artwork-image').length, 3);
+});
+
+test('failed image preparation does not prevent another region from retrying the same URL', async t => {
+  const { app, w, api, doc } = mockApp(t);
+  const config = api.uploadConfig(doc(fixture('movie-poster.html')), 'poster', app.target);
+  const asset = { url: 'https://m.media-amazon.com/retry.jpg', variants: ['https://m.media-amazon.com/retry.jpg'] };
+  const card = w.document.createElement('div'); app.results.append(card);
+  const originalPrepare = app.prepare;
+  app.prepare = async () => { throw new Error('Temporary download failure'); };
+  await assert.rejects(app.addAssets([asset], {}, card, config, app.controller.signal), /Temporary download failure/);
+  app.prepare = originalPrepare;
+  await app.addAssets([asset], {}, card, config, app.controller.signal);
+  assert.equal(card.querySelectorAll('.artwork-image').length, 1);
 });
 
 test('Kanopy performs an anonymous visitor handshake and retains the upload confirmation gate', async t => {
@@ -867,8 +969,8 @@ test('Back preserves discovery state, ignores late work, and remains available o
   const selected = { sources: [api.manualSource('https://tv.apple.com/gb/movie/fixture/umc.cmc.fixturemovieone')] };
   const pending = app.fetchTitle(selected, 'poster'); await tick();
   const oldSignal = app.controller.signal;
-  assert.match(app.status.textContent, /Fetching artwork/);
-  app.preview.querySelector('button').click();
+  assert.equal(app.status.textContent, '');
+  app.backButton.click();
   assert.equal(oldSignal.aborted, true); assert.equal(app.results, results); assert.equal(app.status, status);
   assert.equal(app.panel.scrollTop, 83); assert.equal(app.discovery.hidden, false);
   assert.equal(app.panel.querySelector('[aria-label="Search title"]').value, 'Kept query');
@@ -902,14 +1004,14 @@ test('Back after upload allows another kind and cached provider artwork uses fre
   const oldBlock = app.results;
   const upload = [...oldBlock.querySelectorAll('button')].find(b => b.textContent === 'Upload this image');
   upload.click(); await tick();
-  assert.equal(app.preview.querySelector('button').disabled, true);
+  assert.equal(app.backButton.disabled, true);
   app.back(); assert.equal(app.previewing, true);
   releaseUpload(); await tick(); await tick();
-  assert.equal(app.preview.querySelector('button').disabled, false);
+  assert.equal(app.backButton.disabled, false);
   assert.match(oldBlock.textContent, /Uploaded/);
   app.back(); await app.fetchTitle(selected, 'backdrop');
   assert.equal(reads, 1); assert.deepEqual(formKinds, ['poster', 'poster', 'backdrop']);
-  assert.equal(app.results.querySelector('[aria-label="Image language"]').value, 'xx-XX');
+  assert.equal(app.results.querySelector('[aria-label="Language"]').value, 'xx-XX');
   upload.click(); await tick(); assert.equal(calls.filter(c => c.url === '/image').length, 1);
 });
 

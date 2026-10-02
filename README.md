@@ -23,7 +23,10 @@ Supports movies and whole TV series. No API key or backend required.
   **Send artwork to TMDB**. Google consent/challenges use **Open Google to resolve**.
 - Review the JPEG, crop, and language, then **Upload this image** or **Save JPEG**.
   Images are center-cropped to 16:9 or 2:3 within TMDB's limits, without enlarging.
-- **Back to results** restores the search; **×** cancels work and closes Google helpers.
+  Identical artwork URLs share one preview, with links to each source region.
+- Click an image to open a full-screen preview; **View at 100%** lets you inspect
+  details by scrolling. **Escape** or **×** closes the preview.
+- **←** restores the search; the modal's **×** cancels work and closes Google helpers.
   Results are cached for 15 minutes; **Clear cache** keeps settings and saved links.
 
 Uploads require confirmation. After an ambiguous failure, check the gallery before

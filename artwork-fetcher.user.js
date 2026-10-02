@@ -769,7 +769,6 @@
     .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(270px,100%),1fr)); gap:16px; }
     .artwork-grid { grid-template-columns:repeat(auto-fill,minmax(min(270px,100%),1fr)); align-items:start; }
     .card { padding:14px; border:1px solid #426279; border-radius:8px; overflow:hidden; }
-    .artwork-heading { text-align:center; margin:0 0 14px; }
     .artwork-sources { display:flex; flex-wrap:wrap; gap:4px 12px; }
     .artwork-provider-name, .artwork-sources a { white-space:nowrap; }
     .artwork-footer { display:grid; gap:12px; margin-top:12px; padding-top:12px; border-top:1px solid #426279; }
@@ -1259,7 +1258,7 @@
       this.preview = element('div');
       this.results = element('div', null, { class: 'grid artwork-grid' }); this.status = element('p', '', { class: 'status', role: 'status' });
       this.backButton.hidden = false;
-      this.preview.append(element('h3', kind === 'poster' ? 'Poster' : 'Background', { class: 'artwork-heading' }), this.status, this.results);
+      this.preview.append(this.status, this.results);
       this.panel.append(this.preview); this.panel.scrollTop = 0;
       this.backButton.focus({ preventScroll: true });
       const { results, status } = this;
